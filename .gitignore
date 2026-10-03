@@ -10,3 +10,4 @@ rec_intention/pre_train_model
 /rec_intention/checkpoints/
 /rec_intention/kg_data/
 data/
+.idea/
