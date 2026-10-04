@@ -19,3 +19,5 @@ build/
 dist/
 inno_build/
 *.spec
+
+*/__pycache__/
