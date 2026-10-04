@@ -1,47 +1,98 @@
-[Setup]
-; 应用程序的名称和版本
-AppName=原神桌面宠物
-AppVersion=1.1
+; =============================================================
+; 原神桌面宠物 安装脚本（Inno Setup 6）
+;
+; 前置步骤（PyInstaller 6+，onedir 模式）：
+;   uv run --with pyinstaller pyinstaller desktoppet.py ^
+;       --name "原神桌面宠物" --onedir --noconsole ^
+;       --icon=src/icon256.ico --clean --noconfirm ^
+;       --add-data "config.yaml;." ^
+;       --add-data "assets.db;." ^
+;       --add-data "src/icon256.ico;."
+;
+; 编译：
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
+;
+; 说明：
+; - 资源已收进单个 assets.db，无需再打包 png/、music/ 目录；
+; - 程序运行时需写 config.yaml / assets.db（保存设置、导入素材），
+;   因此默认安装到用户目录（免管理员权限），不要改装 Program Files。
+; =============================================================
 
-; 安装程序的输出文件名
-OutputDir=./inno_build
-OutputBaseFilename=原神桌面宠物安装向导
-LicenseFile=license
-; 安装程序的窗口设置
+#define AppName "原神桌面宠物"
+#define AppVersion "2.1"
+#define AppPublisher "于鹏飞"
+#define AppURL "https://gitee.com/yupengfei1074064684/yuanshen-desktoppet/tree/master"
+#define AppExeName "原神桌面宠物.exe"
+
+[Setup]
+; AppId 唯一标识本应用，升级安装/卸载都依赖它，发布后不要修改
+AppId={{2B18A692-647A-4A78-BAF2-489F44D660B4}
+AppName={#AppName}
+AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
+AppPublisher={#AppPublisher}
+AppPublisherURL={#AppURL}
+AppSupportURL={#AppURL}
+AppUpdatesURL={#AppURL}
+
+; 安装到当前用户目录：免管理员权限，且程序可写自身配置与资源库
+DefaultDirName={localappdata}\Programs\{#AppName}
+DefaultGroupName={#AppName}
+DisableProgramGroupPage=yes
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+
+; 仅 64 位系统
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+
+; 界面与外观
+LicenseFile=LICENSE
 SetupIconFile=src\icon256.ico
 WizardImageFile=src\icon256.bmp
 WizardSmallImageFile=src\icon256.bmp
-AppPublisher=于鹏飞
-AppPublisherURL=https://gitee.com/yupengfei1074064684/yuanshen-desktoppet/tree/master
+WizardStyle=modern
+UninstallDisplayIcon={app}\icon256.ico
 
-; 其他设置...
-DefaultDirName={commonpf}\原神桌面宠物
-DisableProgramGroupPage=yes
-Compression=lzma
+; 输出
+OutputDir=./inno_build
+OutputBaseFilename=原神桌面宠物安装向导
+
+; 压缩：资源本身已压缩（PNG/MP3），normal 级别在体积和构建速度间较均衡
+Compression=lzma2/normal
 SolidCompression=yes
+
+; 覆盖安装前自动关闭正在运行的宠物，避免文件占用导致安装失败
+CloseApplications=yes
+CloseApplicationsFilter=*.exe
+RestartApplications=no
 
 [Languages]
 Name: "zh_CN"; MessagesFile: "ChineseSimplified.isl"
 
-[Files]
-; 包含 PyInstaller 打包的应用程序目录
-Source: "dist\原神桌面宠物\原神桌面宠物.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "src\icon256.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\原神桌面宠物\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs
-[Icons]
-; 创建开始菜单的快捷方式;设置快捷方式的图标
-Name: "{group}\原神桌面宠物"; Filename: "{app}\原神桌面宠物.exe";IconFilename: "{app}\icon256.ico"
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "startupicon"; Description: "开机自动启动"; GroupDescription: "其他:"; Flags: unchecked
 
-[Code]
-procedure CurPageChanged(CurPageID: Integer);
-begin
-  if CurPageID = wpWelcome then
-  begin
-    // 用户处于欢迎页面时显示消息框
-    MsgBox('感谢您安装原神桌面宠物。如需支持，请联系作者:于鹏飞，Email:mr_yupengfei@foxmail.com', mbInformation, MB_OK);
-  end;
-end;
+[Files]
+; PyInstaller onedir 输出：exe 在根，其余在 _internal（含 assets.db、config.yaml）
+Source: "dist\原神桌面宠物\原神桌面宠物.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\原神桌面宠物\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs
+Source: "src\icon256.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+; 开始菜单
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\icon256.ico"
+Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
+; 桌面（可选任务）
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\icon256.ico"; Tasks: desktopicon
+; 开机自启（可选任务）
+Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: startupicon
 
 [Run]
-; 安装后运行应用程序
-Filename: "{app}\原神桌面宠物.exe"; Description: "{cm:LaunchProgram,原神桌面宠物}"; Flags: nowait postinstall
+; 安装完成后启动
+Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; 卸载时清理运行期产生的缓存目录
+Type: filesandordirs; Name: "{app}\_internal\__pycache__"

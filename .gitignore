@@ -11,3 +11,11 @@ rec_intention/pre_train_model
 /rec_intention/kg_data/
 data/
 .idea/
+# 由 tools/build_assets_db.py 生成
+assets.db
+
+# 打包产物
+build/
+dist/
+inno_build/
+*.spec
