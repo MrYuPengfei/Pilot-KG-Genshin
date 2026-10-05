@@ -9,15 +9,31 @@ DesktopPet1.0
 rec_intention/pre_train_model
 /rec_intention/checkpoints/
 /rec_intention/kg_data/
+# data/ 整个目录不入库，且不随安装包分发（见 原神桌面伙伴.spec）：
+#   data/csv          知识图谱初始 CSV（27 个）——构建 kg.db 的输入
+#   data/config.yaml  出厂配置种子——构建 config.db 的输入
+#   data/png|music|bgm 原始素材（已并入 assets.db）
+#   data/kg           知识图谱导出目录
+# 运行时只读三个 .db，缺失时按内置默认值 + assets.db 自动兜底。
 data/
 .idea/
+.workbuddy/
+.venv/
 # 由 tools/build_assets_db.py 生成
 assets.db
+# 知识图谱库（由 tools/build_databases.py 从 data/csv 构建）
+kg.db
+# 配置库（出厂值随包分发，升级时 onlyifdoesntexist 保护用户改动）
+config.db
 
 # 打包产物
 build/
 dist/
+dist_data/
 inno_build/
 *.spec
 
 __pycache__/
+
+# 展示文件
+exhibition/

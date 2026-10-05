@@ -1,6 +1,9 @@
-"""第三方素材包导入模块的测试：目录导入、zip 导入、幂等性、config 登记、自定义地区。"""
+"""第三方素材包导入模块的测试：目录导入、zip 导入、幂等性、配置登记、自定义地区。
 
-import os
+v3.4：配置改由 ConfigStore（SQLite）管理，import_assets 第三参数由
+config.yaml 路径改为 ConfigStore 实例。
+"""
+
 import sys
 import zipfile
 from pathlib import Path
@@ -12,6 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
 from asset_importer import import_assets  # noqa: E402
+from config_store import ConfigStore  # noqa: E402
 from resource_store import ResourceStore  # noqa: E402
 
 
@@ -36,19 +40,26 @@ def pack_dir(tmp_path):
 
 
 @pytest.fixture()
-def config_file(tmp_path):
-    cfg = tmp_path / 'config.yaml'
-    cfg.write_text(yaml.dump({
+def config_store(tmp_path):
+    """独立目录的配置库，避免污染真实的 config.db。
+
+    v3.5 起 ConfigStore 运行时不再读 YAML，种子须显式传入 seed_path
+    （这正是 tools/build_databases.py 生成出厂 config.db 的用法）。
+    """
+    app = tmp_path / 'app'
+    (app / 'data').mkdir(parents=True)
+    seed = app / 'data' / 'config.yaml'
+    seed.write_text(yaml.dump({
         'audio': True, 'bg_music': False, 'role': '达达利亚',
         'frame_scale': {'达达利亚': [60, 1.0]},
         'img_path': 'png', 'music_path': 'music',
     }, allow_unicode=True), encoding='utf-8')
-    return cfg
+    return ConfigStore(str(app), seed_path=str(seed))
 
 
-def test_import_from_directory(pack_dir, config_file, tmp_path):
+def test_import_from_directory(pack_dir, config_store, tmp_path):
     db = tmp_path / 'assets.db'
-    report = import_assets(str(pack_dir), str(db), str(config_file))
+    report = import_assets(str(pack_dir), str(db), config_store)
 
     assert report['frames'] == 2
     assert report['voices'] == 2
@@ -67,14 +78,30 @@ def test_import_from_directory(pack_dir, config_file, tmp_path):
     assert store.read_bgm('须弥') == b'MP3-SUMERU-BGM'
     store.close()
 
-    # 新角色已登记 frame_scale 默认值，且原有配置未被破坏
-    cfg = yaml.safe_load(config_file.read_text(encoding='utf-8'))
+    # 新角色已在配置库登记默认帧率/缩放，且原有配置未被破坏
+    cfg = config_store.load()
     assert cfg['frame_scale']['自定义角色'] == [60, 1.0]
     assert cfg['frame_scale']['达达利亚'] == [60, 1.0]
     assert cfg['role'] == '达达利亚'
 
 
-def test_import_from_zip(pack_dir, config_file, tmp_path):
+def test_import_keeps_custom_timing(pack_dir, config_store, tmp_path):
+    """重复导入不覆盖用户为该角色手工调过的帧率/缩放。"""
+    db = tmp_path / 'assets.db'
+    import_assets(str(pack_dir), str(db), config_store)
+    config_store.set_frame_scale('自定义角色', 90, 1.7)
+    import_assets(str(pack_dir), str(db), config_store)
+    assert config_store.frame_scale('自定义角色') == [90, 1.7]
+
+
+def test_import_without_config_store(pack_dir, tmp_path):
+    """不传配置库时也能导入（仅跳过角色登记）。"""
+    db = tmp_path / 'assets.db'
+    report = import_assets(str(pack_dir), str(db))
+    assert report['frames'] == 2
+
+
+def test_import_from_zip(pack_dir, config_store, tmp_path):
     zip_path = tmp_path / 'pack.zip'
     with zipfile.ZipFile(zip_path, 'w') as zf:
         for path in pack_dir.rglob('*'):
@@ -83,17 +110,17 @@ def test_import_from_zip(pack_dir, config_file, tmp_path):
                 zf.write(path, Path('我的素材包') / path.relative_to(pack_dir))
 
     db = tmp_path / 'assets.db'
-    report = import_assets(str(zip_path), str(db), str(config_file))
+    report = import_assets(str(zip_path), str(db), config_store)
     assert report['frames'] == 2
     assert report['areas'] == ['须弥']
 
 
-def test_import_is_idempotent_and_supports_update(pack_dir, config_file, tmp_path):
+def test_import_is_idempotent_and_supports_update(pack_dir, config_store, tmp_path):
     db = tmp_path / 'assets.db'
-    import_assets(str(pack_dir), str(db), str(config_file))
+    import_assets(str(pack_dir), str(db), config_store)
     # 修改包内一帧后重复导入：覆盖更新，不产生重复记录
     (pack_dir / 'png' / '自定义角色' / '0001.png').write_bytes(b'PNG-A-V2')
-    report = import_assets(str(pack_dir), str(db), str(config_file))
+    report = import_assets(str(pack_dir), str(db), config_store)
     assert report['new_roles'] == []  # 已存在，不算新角色
 
     store = ResourceStore(str(tmp_path))
@@ -102,13 +129,13 @@ def test_import_is_idempotent_and_supports_update(pack_dir, config_file, tmp_pat
     store.close()
 
 
-def test_import_empty_pack_raises(tmp_path, config_file):
+def test_import_empty_pack_raises(tmp_path, config_store):
     empty = tmp_path / '空包'
     empty.mkdir()
     with pytest.raises(ValueError, match='未找到可导入的资源'):
-        import_assets(str(empty), str(tmp_path / 'assets.db'), str(config_file))
+        import_assets(str(empty), str(tmp_path / 'assets.db'), config_store)
 
 
-def test_import_missing_path_raises(tmp_path, config_file):
+def test_import_missing_path_raises(tmp_path, config_store):
     with pytest.raises(FileNotFoundError):
-        import_assets(str(tmp_path / '不存在'), str(tmp_path / 'assets.db'), str(config_file))
+        import_assets(str(tmp_path / '不存在'), str(tmp_path / 'assets.db'), config_store)

@@ -3,7 +3,6 @@
 使用临时目录构造迷你资源树，同时验证文件系统回退和 SQLite 两种后端行为一致。
 """
 
-import os
 import sys
 from pathlib import Path
 

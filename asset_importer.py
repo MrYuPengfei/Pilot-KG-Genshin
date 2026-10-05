@@ -1,4 +1,4 @@
-"""第三方素材包导入模块：把自定义人物/地区资源并入 assets.db，并同步 config.yaml。
+"""第三方素材包导入模块：把自定义人物/地区资源并入 assets.db，并登记配置。
 
 素材包可以是目录或 zip 文件，内部布局与项目一致：
 
@@ -8,15 +8,13 @@
       music/<地区>/background.mp3      -> 地区背景音乐（目录含 background.mp3 即识别为地区）
 
 png/ 与 music/ 可只提供其一；已有资源同名覆盖，新增资源直接并入。
-新角色会自动在 config.yaml 的 frame_scale 中登记默认值 [60, 1.0]。
+新角色会自动在配置库（config.db）的 frame_scale 中登记默认值 [60, 1.0]。
 """
 
 import os
 import sqlite3
 import tempfile
 import zipfile
-
-import yaml
 
 from tools.build_assets_db import iter_assets
 
@@ -53,8 +51,11 @@ def _extract_if_zip(src):
     raise FileNotFoundError(f'素材包不存在或格式不支持: {src}')
 
 
-def import_assets(src, db_path, config_path=None, img_dir='png', music_dir='music'):
+def import_assets(src, db_path, config_store=None, img_dir='png', music_dir='music'):
     """导入素材包，返回导入报告 dict。
+
+    ``config_store`` 为 :class:`config_store.ConfigStore` 实例（v3.4 起配置走
+    SQLite）；传入时会为新角色登记默认帧率/缩放。
 
     report = {
         'frames': 新增/更新帧数, 'voices': ..., 'bgms': ...,
@@ -101,8 +102,9 @@ def import_assets(src, db_path, config_path=None, img_dir='png', music_dir='musi
     if total == 0:
         raise ValueError(f'素材包中未找到可导入的资源（需要 png/ 或 music/ 目录）: {src_dir}')
 
-    if config_path and report['roles']:
-        _register_roles_in_config(config_path, report['roles'])
+    if config_store is not None and report['roles']:
+        for role in report['roles']:
+            config_store.register_role(role, *DEFAULT_FRAME_SCALE)
 
     report['roles'] = sorted(report['roles'])
     report['areas'] = sorted(report['areas'])
@@ -111,11 +113,8 @@ def import_assets(src, db_path, config_path=None, img_dir='png', music_dir='musi
 
 
 def _register_roles_in_config(config_path, roles):
-    """在 config.yaml 的 frame_scale 中为缺失的角色登记默认值。"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
-    frame_scale = cfg.setdefault('frame_scale', {})
-    for role in roles:
-        frame_scale.setdefault(role, list(DEFAULT_FRAME_SCALE))
-    with open(config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    """（已废弃）v3.3 及之前直接改写 config.yaml 的登记逻辑。
+
+    v3.4 起配置改由 ConfigStore（SQLite）管理，请改用
+    ``config_store.register_role(role, interval, scale)``。
+    """

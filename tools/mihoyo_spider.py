@@ -1,7 +1,5 @@
-import copy
 import json
 import os
-import pprint
 import re
 import time
 import pandas as pd
@@ -183,7 +181,7 @@ class FoodSpider(MiHoYoSpider):
 
                     try:
                         material = re.findall('class="obc-tmpl__icon-text">([\u4e00-\u9fa5]+)</span></a> <span ', text)
-                        num = re.findall('class="obc-tmpl__icon-num">(\*\d+)</span></div>', text)
+                        num = re.findall(r'class="obc-tmpl__icon-num">(\*\d+)</span></div>', text)
                     except:
                         material, num = [], []
                     descs = re.findall('描述：(.*?)<', text)
@@ -275,7 +273,7 @@ class WeaponSpider(MiHoYoSpider):
                 grade = [re.sub('<(.*?)>', '', str(i)) for i in
                          re.findall('class="obc-tmpl__switch-btn">(.*?)</li>', text)]
                 effect = [re.sub('<(.*?)>', '', str(i)) for i in
-                          re.findall('<tbody><tr><td colspan="\d">(.*?)</li></ul></td></tr></tbody>', text)]
+                          re.findall(r'<tbody><tr><td colspan="\d">(.*?)</li></ul></td></tr></tbody>', text)]
                 print(name)
                 data = [{'name': name, 'id': id, 'ext': ext, 'desc': desc, 'limit': limit, 'story': story,
                          'material': material, "material_num": material_num, 'grade': grade, 'effect': effect,
@@ -314,10 +312,10 @@ class WeaponSpider(MiHoYoSpider):
                 return 'None'
             else:
                 if mode == 0:
-                    s = ''.join(re.findall('\)(.*?)·', x[0]))
+                    s = ''.join(re.findall(r'\)(.*?)·', x[0]))
                     return s if s else 'None'
                 else:
-                    sp = ''.join(re.findall('\)(.*?)·', x[0])) + '·'
+                    sp = ''.join(re.findall(r'\)(.*?)·', x[0])) + '·'
                     return x[0].replace(sp, '')
 
         df['introd'] = df['desc'].apply(lambda x: skill(x, 0))
@@ -398,7 +396,7 @@ class NPCSpider(MiHoYoSpider):
         df['task'] = df['task'].apply(lambda x: '暂无' if x in ['无', '暂无数据', '待录入'] else x)
         df['profession'] = df['profession'].apply(lambda x: '暂无' if x in ['无', '暂无数据', '待录入'] else x)
         df['tips'] = df['tips'].apply(
-            lambda x: str([i for i in eval(x) if not re.findall('\[每(.*?)日\]|食谱：|\[每周\]| \* |\d', i)]))
+            lambda x: str([i for i in eval(x) if not re.findall(r'\[每(.*?)日\]|食谱：|\[每周\]| \* |\d', i)]))
         df['tips'] = df['tips'].apply(lambda x: ''.join(eval(x)))
         df.fillna('暂无', inplace=True, axis=1)
         df.to_csv('../rec_intention/kg_data/done/label-npc.csv', index=False, encoding='utf-8')
@@ -415,7 +413,7 @@ class BreakMaterialSpider(MiHoYoSpider):
 
         def split_info(x, mode):
             x = (eval(x))
-            x = [re.sub('[\d]+级\*(\d\d|\d)[；]*', '', i) for i in x]
+            x = [re.sub(r'[\d]+级\*(\d\d|\d)[；]*', '', i) for i in x]
             getting_idx, desc_idx, using_idx = -1, -1, -1
             for i in range(len(x)):
                 # if '获得方式：' in x[i]:

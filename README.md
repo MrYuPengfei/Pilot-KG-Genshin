@@ -10,35 +10,68 @@ Genshin （一款游戏）原神；
 
 打造一个桌面端小助手，通过大规模的文本数据训练原神领域的文本预训练模型， 利用收集到的三元组数据搭建原神知识图谱，通过预训练模型进行语音识别和智能问答，通过语音合成技术来帮助回答用户问题。
 
-当前版本（v2.1）已实现：28 位原神人物的桌面宠物（逐帧动画、拖动、隐藏）、人物语音与地区背景音乐、SQLite 资源库与帧缓存、第三方素材包导入、图形化管理面板；语音识别与智能问答仍在规划中（见「后期开发」）。
+当前版本（v3.7）已实现：28 位原神人物的桌面伙伴（逐帧动画、拖动、隐藏）、人物语音与地区背景音乐、SQLite 资源库与帧缓存、第三方素材包导入、图形化管理面板（含知识图谱可视化/编辑、素材导出与配置导入导出）；语音识别与智能问答仍在规划中（见「后期开发」）。
+
+#### 目录结构
+
+```
+Pilot-KG-Genshin/
+├── pilot.py                 主程序（入口，含托盘菜单与动画主循环）
+├── manager_panel.py         管理面板（人物/音乐/素材/知识图谱/帮助文档）
+├── resource_store.py        资源访问抽象层（优先 assets.db，回退文件系统）
+├── config_store.py          配置存储层（config.db 持久化 + 导入导出）
+├── asset_exporter.py        素材导出（assets.db → png/ 与 music/ 目录或 zip）
+├── asset_importer.py        第三方素材包导入核心
+├── kg_store.py              知识图谱存储层（kg.db 持久化 + CSV 导入导出 + 增删改）
+├── kg_editor.py             知识图谱编辑对话框（实体属性表 / 关系两端选择）
+├── kg_view.py               知识图谱可视化组件（自我中心网画布）
+├── assets.db                资源数据库（由 tools/build_assets_db.py 构建）
+├── kg.db                    知识图谱数据库（由 tools/build_databases.py 构建）
+├── config.db                出厂配置 + 用户本机设置（同一文件）
+├── data/                    ⚠️ 仅构建输入：既不入 git、也不随安装包分发
+│   ├── config.yaml          出厂配置种子（构建 config.db 用）
+│   └── csv/                 知识图谱初始 CSV（27 个，构建 kg.db 用）
+├── ico/                     图标（icon256.ico / .bmp、app_icon.ico、logo.ico）
+├── tools/                   构建、命令行与数据采集工具
+├── tests/                   pytest 测试
+└── png/、music/             原始素材目录（打包进 assets.db 后可不分发）
+```
 
 #### 安装教程
 A：Terminal/cmd（终端操作）
-1. git clone https://github.com/MrYuPengfei/yuanshen-desktoppet.git 克隆项目。
-2. cd yuanshen-desktoppet 进入目录，使用 `uv sync` 安装依赖。
-3. 在config.yaml中配置自己对应的路径和设置
+1. git clone https://github.com/MrYuPengfei/Pilot-KG-Genshin.git 克隆项目。
+2. cd Pilot-KG-Genshin 进入目录，使用 `uv sync` 安装依赖。
+3. **构建三个数据库**：安装包只带 SQLite 库，不含 CSV/YAML——它们是构建输入。运行 `uv run python tools/build_assets_db.py` 与 `uv run python tools/build_databases.py` 生成 `assets.db` / `kg.db` / `config.db`。克隆后的仓库里这三个库都不存在（已入 `.gitignore`），必须先构建。
+   随后首次运行会自动生成 `config.db`（有 `data/config.yaml` 时以其为种子，无则按 `assets.db` 补齐人物登记）；如需修改设置，启动后经托盘「管理面板 → 素材管理」调整即可（也可用该页的「导出/导入配置」备份或迁移）
 4. （可选）`uv run python tools/build_assets_db.py` 把 png/、music/ 下的零散资源打包为单个 assets.db；存在数据库时程序自动从数据库读取，否则回退读取目录文件。
-5. (1) `uv run python desktoppet.py` 运行程序<br>
+5. (1) `uv run python pilot.py` 运行程序<br>
    (2)或直接在PyCharm等编辑器中直接右键运行。
-   (3)在终端输入 nohup python -u desktoppet.py >pet.log 2>&1 & （直接后台运行程序！这样就不用一直开着编辑器了！）
+   (3)在终端输入 nohup python -u pilot.py >pet.log 2>&1 & （直接后台运行程序！这样就不用一直开着编辑器了！）
 
 B：Windows 安装包（免环境）
-直接运行「原神桌面宠物安装向导.exe」即可，安装到用户目录（%LOCALAPPDATA%\Programs），无需管理员权限与 Python 环境。自行打包流程见 [部署到WindowsNT.md](部署到WindowsNT.md)。
+直接运行「原神桌面伙伴安装向导.exe」即可，安装到用户目录（%LOCALAPPDATA%\Programs），无需管理员权限与 Python 环境。安装时可选勾选创建桌面图标与开机自启（默认不勾选）。
+
+项目详细介绍见 [项目详细介绍.md](exhibition/项目详细介绍.md)。
+
+自行打包流程见 [部署到WindowsNT.md](doc/部署到WindowsNT.md)。
+
+![安装模式选择](exhibition/data/Snipaste_2026-10-04_10-53-09.png)
 
 #### 使用说明
 
-1. 基于PySide6开发的原神桌面宠物，内置 28 个人物（可导入第三方素材继续扩充）。
-2. 目前png和gif图片已经全部转换完成，已经上传，项目下载安装好依赖就可以运行。（仅供开发研究玩乐，请勿当做商业用途！！！）
-3. 着实不太建议非社交牛逼症患者在白天以及人多的地方使用，社交牛逼症患者或二刺猿重度患者请自便。
-4. *****友情提示：语音默认开启。（上班请静音，小心社死！dddd！）*****
-5. 文件目录如下图所示:![5](src/5.jpg)
+1. 基于 PySide6 开发的原神桌面伙伴，内置 28 位人物（可用素材包导入继续扩充）。
+2. 程序启动后常驻系统托盘，**托盘图标是唯一入口**：人物、音乐、管理面板、显示、退出都在右键菜单里；桌面窗口可拖动、右键隐藏。
+3. 素材（png/gif 已全部转换完成并随仓库上传），克隆后装好依赖即可运行。（仅供开发研究玩乐，请勿当做商业用途！！！）
+4. 着实不太建议非社交牛逼症患者在白天以及人多的地方使用，社交牛逼症患者或二刺猿重度患者请自便。
+5. *****友情提示：语音默认开启。（上班请静音，小心社死！dddd！）***** 
 
 #### 功能说明
 
-1. 支持人物的切换、拖动、隐藏、简单交互。
-2. 快捷键说明：macOS==>缩放人物：Command + Command - 退出 Command Q <br>
-Windows==>缩放人物：Ctrl + Ctrl - 退出 Ctrl Q
-3. 支持背景音乐和人物语音播放。（音量调节待开发中）
+1. 支持人物的切换、拖动、隐藏、简单交互（拖动窗口、点击触发语音等）。
+2. 快捷键：
+   - Windows：<code>Ctrl + ↑</code> / <code>Ctrl + ↓</code> 缩放人物，<code>Ctrl + Q</code> 退出；
+   - macOS：<code>Command + ↑</code> / <code>Command + ↓</code> 缩放人物，<code>Command + Q</code> 退出。
+3. 支持背景音乐和人物语音播放，音量可在管理面板或系统音量条调节。
 4. 资源管理基于 SQLite 单文件数据库（assets.db）：近万零散资源打包为一个文件，换人物时全帧预加载进内存，动画播放零磁盘 I/O；没有数据库时自动回退读取 png/、music/ 目录。
 5. 支持自行添加人物、语音、音乐：把素材按下述布局放成文件夹或 zip，通过托盘菜单「管理面板 → 素材管理」导入，或使用命令行 `uv run python tools/import_assets.py <素材包路径>`，导入后新人物/新地区直接出现在菜单里：
 
@@ -50,23 +83,23 @@ Windows==>缩放人物：Ctrl + Ctrl - 退出 Ctrl Q
 ```
 
 6. 托盘菜单「管理面板」提供图形化管理：
-   - 人物管理：帧预览、按人物调整帧率/缩放（即时生效并保存）、设为当前宠物、删除人物；
+   - 人物管理：帧预览、按人物调整帧率/缩放（即时生效并保存）、设为当前伙伴、删除人物；
    - 音乐管理：地区背景音乐播放/停止、人物语音开关、一键静音；
-   - 素材管理：资源统计、素材包导入；
-   - 知识图谱：基于 GenshinKG 数据的可视化探索（12 类实体、1900+ 节点、7500+ 关系），支持实体搜索、单击查看属性与关系、双击节点展开关系网；
+   - 素材管理：资源统计、素材包导入、**素材导出**（全部或仅当前人物，目录或 zip，结果可再导入）、配置导出（YAML/JSON）与导入（覆盖/合并）；
+   - 知识图谱：基于 kg.db 的可视化探索与编辑（12 类实体、1900+ 节点、7300+ 关系），支持实体搜索、单击查看属性与关系、双击节点展开关系网；可新增/改名/改类型/改属性/删除实体，以及新增/改名/换对端/删除关系；支持 CSV 目录或单文件导入（合并或覆盖）与按原始布局导出；
    - 帮助文档：素材导入注意事项、版本变更记录、第三方开源库与许可说明。
 7. 内置人物（28 位）：七七、优菈、八重神子、刻晴、可莉、夜兰、宵宫、早柚、枫原万叶、珊瑚宫心海、班尼特、琴、甘雨、神里绫人、神里绫华、胡桃、芭芭拉、荒泷一斗、莫娜、菲谢尔、行秋、达达利亚、迪卢克、迪奥娜、钟离、阿贝多、雷电将军、魈；内置背景音乐地区：蒙德、璃月、稻妻。
 
 
 #### 界面展示
 
-![1](src/1.png)
-![2](src/2.png)
-![3](src/3.png)
-![4](src/4.png)
+![知识图谱·可莉](exhibition/data/Snipaste_2026-10-04_11-00-37.png)
+![知识图谱·关系清单](exhibition/data/Snipaste_2026-10-04_11-01-27.png)
+![人物管理](exhibition/data/Snipaste_2026-10-04_10-59-35.png)
+![素材管理](exhibition/data/Snipaste_2026-10-04_10-59-43.png)
 #### windows任务栏显示菜单
 
-![任务栏显示菜单](src/任务栏显示菜单.png)
+![托盘菜单](exhibition/data/Snipaste_2026-10-04_10-56-03.png)
 ### 知识图谱设计和展示
 #### 节点设计（12类）<br>
 人物：character<br>
@@ -97,43 +130,59 @@ Windows==>缩放人物：Ctrl + Ctrl - 退出 Ctrl Q
 副本-位于-地区<br>
 怪物-掉落-材料<br>
 武器-突破材料是-材料<br>
-![4](src/原神知识图谱设计.png)
-![5](src/neo4j.png)
+![知识图谱设计](exhibition/data/知识图谱.jpg)
+![图数据库](exhibition/data/neo4j.png)
 
 
 #### 版本记录
 
-- **v3.0**：知识图谱可视化（管理面板「知识图谱」页：实体搜索、自我中心网、属性与关系详情、双击展开）；托盘菜单精简。
+- **v3.7**：**切换人物时按时段问好**（托盘或面板切换后按当前小时判定问候；冷却按「同一人 + 同一时段」计，换人或跨时段立即问候）；「素材管理」页导入与导出**拆为两个独立分组**，所有按钮尺寸统一为 132×32；**修复四类崩溃与警告**——图谱双击抛 `Internal C++ object already deleted`、编辑对话框补全抛 `itemFromIndex(str)`、画布 `ungrabMouse: not a mouse grabber`、启动时托盘 `No Icon set`；**代码质量整改**（清理 15 处无效正则转义警告与无用导入、修正一处会触发 NameError 的 f-string 笔误、消除重复定义，核心模块静态检查零告警）。
+- **v3.6**：新增**素材导出**（管理面板「素材管理」页，全部/仅当前人物 × 目录/zip，结果符合素材包格式可再导入）；**修复人物切换异常**（切换后不再被拽回左上角、窗口尺寸正确跟随缩放、大缩放角色不出屏、切换后立即落库），修正动画帧循环跳过首帧与切换时 QLabel 堆积；**修复角色问好**（语音分类器改按关键词识别问候语，菲谢尔/迪奥娜的「早上好问候菲谢尔.mp3」等此前被归为无分类导致早上问候失败；时段表补全 0~3 点与 15~17 点共 7 小时静默；缺语音自动降级；问候只在启动时播一次）；**移除「恢复出厂设置」按钮**（改为删除 config.db 后重装）。
+- **v3.5**：数据一律由 SQLite 管理——安装包只带 `assets.db` / `kg.db` / `config.db` 三个库与图标，**不含任何 CSV / YAML**；新增 `tools/build_databases.py` 由 `data/csv`、`data/config.yaml` 构建两个库（CSV/YAML 降级为构建输入）；运行时彻底不读 CSV/YAML（实测删除整个 `data/` 后功能完整）；两个库新增 `schema_version` 与来源元信息、`kg_store` 补 `set_meta/get_meta/info`；`config.db` 以 `onlyifdoesntexist` 安装，升级不覆盖用户配置。此举为后续 C/S 架构预留——服务器下发 CSV/YAML 即可，客户端用现成导入接口入库。
+- **v3.4**：目录重构（`src/` → `ico/`、`GenshinKG/data/` → `data/csv/`、`GenshinKG/utils/` 并入 `tools/`，`GenshinKG/` 目录取消）；配置改用 SQLite（新增 `config_store.py` 与 `config.db`，`config.yaml` 移至 `data/config.yaml` 并降级为种子/导入导出格式）；新增配置文件导入导出；配置种子损坏或人物无资源时自动兜底。**`data/` 整个目录不再纳入 git 管理**（含 27 个知识图谱 CSV 与配置种子），新克隆需自行补齐该目录，详见安装教程第 3 步。
+- **v3.3**：知识图谱入库（新增 `kg.db`，SQLite 三表；首次运行自动播种，CSV 退化为导入/导出格式）；新增知识图谱 CSV 导入（目录/单文件，合并或覆盖）与导出（可整目录回灌）；新增节点与关系的增删改（改名/改类型/改属性自动迁移关系端点，关系列表区分方向）。
+- **v3.2**：文档全面完善（README、部署说明、重构日志、管理面板帮助页）；仓库迁移至 `Pilot-KG-Genshin`；帮助页新增管理面板使用说明。
+- **v3.1**：全局更名——「桌面宠物」→「桌面伙伴」，主程序类 `Pet` → `Pilot`，入口脚本 `desktoppet.py` → `pilot.py`，应用名与安装包同步更名；托盘菜单精简。
+- **v3.0**：知识图谱可视化（管理面板「知识图谱」页：实体搜索、自我中心网、属性与关系详情、双击展开）。
 - **v2.1**：新增管理面板（人物/音乐/素材/帮助文档），设置变更即时保存。
 - **v2.0**：SQLite 资源库（assets.db）+ 帧缓存（动画零磁盘 I/O）；第三方素材包导入；全新 Inno Setup 安装包（用户目录安装、免管理员权限）。
-- **v1.x**：基础桌宠功能（切换/拖动/隐藏/语音/背景音乐）。
+- **v1.x**：基础桌面伙伴功能（切换/拖动/隐藏/语音/背景音乐）。
 
 #### 开发与测试
 
 ```shell
-uv run pytest        # 运行测试套件（资源库、素材导入等 12 项）
-uv run python tools/build_assets_db.py   # 重新构建资源数据库
-uv run python tools/import_assets.py <素材包路径>   # 命令行导入素材
+uv run pytest        # 运行测试套件（资源库、配置、素材导入导出、知识图谱、问候、人物切换、画布与编辑交互等 164 项）
+uv run python tools/build_assets_db.py              # 由 png/、music/ 重新构建 assets.db
+uv run python tools/import_assets.py <素材包路径>   # 命令行导入素材包（zip 或目录）
+uv run python tools/smoke_kg_panel.py              # 知识图谱面板离屏冒烟（编辑/导入/导出）
+uv run python -c "from kg_store import get_default_store; get_default_store()"  # 手动初始化 kg.db
 ```
 
-#### 后期开发（V3.1 展望）
-1. ✅ 基于原神信息的知识图谱。(参考GenshinKG文件夹)
-2. ✅ 基于Roberta预训练模型对原神数据进行继续预训练。（https://gitee.com/fg_slash/GenshinBert）
-3. ❎ 用户语音输入、语音识别、意图识别。(未开始)
-4. ❎ 部分人物的语音合成、自动问答。(未开始)
+新增素材后需重跑一次 `build_assets_db.py` 才会进数据库；也可直接在管理面板导入（增量 upsert，不必重建）。
 
-#### 后期开发（V4.0 展望）
-1. 基于P2P技术的社区资源共享
-2. 基于CS架构的客户端更新推送 
+GUI 冒烟测试（无显示环境）：
+
+```shell
+QT_QPA_PLATFORM=offscreen SDL_AUDIODRIVER=dummy uv run python pilot.py
+```
+
+#### 规划中
+1. ✅ 基于原神信息的知识图谱（数据见 `data/csv/`，可视化见管理面板「知识图谱」页）
+2. ✅ 基于 RoBERTa 预训练模型对原神数据进行继续预训练（https://gitee.com/fg_slash/GenshinBert ）
+3. ❎ 用户语音输入、语音识别、意图识别
+4. ❎ 部分人物的语音合成、自动问答
+5. ❎ 音量调节面板化（当前依赖系统音量条）
 
 
 
 #### 参与贡献
 1. 知识一个默默无闻的60级小萌新罢了。
-2. https://github.com/fg0521/Genshin-Impact-Desktoppet.git
-3. 绿幕素材来源于B站UP:皮皮虾米锅巴 
+2. 原项目：https://github.com/fg0521/Genshin-Impact-Desktoppet.git
+3. 绿幕素材来源于B站UP:皮皮虾米锅巴
+4. 知识图谱数据与设计参考 `data/csv/` 目录及 `doc/知识图谱.jpg`
 
-# 制作windows应用程序安装包
-查看部署到WindowsNT.md
-![安装](src/安装.png)
+## 许可协议
 
+本项目源码以 **Apache License 2.0** 开源（详见 [LICENSE](LICENSE)）。
+游戏图像、语音等素材版权归上海米哈游网络科技股份有限公司所有，
+仅供学习交流，请勿用于商业用途。

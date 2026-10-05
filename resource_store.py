@@ -1,6 +1,6 @@
 """资源访问抽象层：优先从 assets.db（SQLite）读取，数据库不存在时回退文件系统。
 
-对上层（desktoppet.py）只暴露字节流和名称列表，不关心底层存储形态。
+对上层（pilot.py）只暴露字节流和名称列表，不关心底层存储形态。
 """
 
 import os
@@ -8,11 +8,17 @@ import sqlite3
 
 BGM_AREAS = ('蒙德', '璃月', '稻妻')
 GREETING_FILES = ('早上好.mp3', '中午好.mp3', '晚上好.mp3', '晚安.mp3')
+# 问候语关键词：语音文件可能带角色后缀（如「早上好问候菲谢尔.mp3」），
+# 不能只做全等匹配，否则这类文件会被判为无分类，问候功能直接失效。
+GREETING_KEYWORDS = ('早上好', '中午好', '晚上好', '晚安')
 
 
 def _classify_voice(filename):
     stem = os.path.splitext(filename)[0]
     if stem in ('早上好', '中午好', '晚上好', '晚安'):
+        return 'greeting'
+    # 带后缀的问候语（如「早上好问候菲谢尔」）；排除「晚安守夜」这类非问候用法
+    if any(k in stem for k in GREETING_KEYWORDS):
         return 'greeting'
     if stem.startswith('闲聊'):
         return 'chat'
