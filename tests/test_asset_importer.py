@@ -1,15 +1,15 @@
 """第三方素材包导入模块的测试：目录导入、zip 导入、幂等性、配置登记、自定义地区。
 
 v3.4：配置改由 ConfigStore（SQLite）管理，import_assets 第三参数由
-config.yaml 路径改为 ConfigStore 实例。
+配置文件路径改为 ConfigStore 实例（v3.8 起该文件为 JSON）。
 """
 
+import json
 import sys
 import zipfile
 from pathlib import Path
 
 import pytest
-import yaml
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
@@ -43,17 +43,18 @@ def pack_dir(tmp_path):
 def config_store(tmp_path):
     """独立目录的配置库，避免污染真实的 config.db。
 
-    v3.5 起 ConfigStore 运行时不再读 YAML，种子须显式传入 seed_path
-    （这正是 tools/build_databases.py 生成出厂 config.db 的用法）。
+    v3.5 起 ConfigStore 运行时不再读种子文件，须显式传入 seed_path
+    （这正是 tools/build_databases.py 生成出厂 config.db 的用法）；
+    v3.8 起种子格式为 JSON。
     """
     app = tmp_path / 'app'
     (app / 'data').mkdir(parents=True)
-    seed = app / 'data' / 'config.yaml'
-    seed.write_text(yaml.dump({
+    seed = app / 'data' / 'config.json'
+    seed.write_text(json.dumps({
         'audio': True, 'bg_music': False, 'role': '达达利亚',
         'frame_scale': {'达达利亚': [60, 1.0]},
         'img_path': 'png', 'music_path': 'music',
-    }, allow_unicode=True), encoding='utf-8')
+    }, ensure_ascii=False), encoding='utf-8')
     return ConfigStore(str(app), seed_path=str(seed))
 
 

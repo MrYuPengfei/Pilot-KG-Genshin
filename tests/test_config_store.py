@@ -4,7 +4,6 @@ import json
 import os
 
 import pytest
-import yaml
 
 from config_store import ConfigStore, DEFAULTS, SCALAR_KEYS
 
@@ -20,15 +19,15 @@ SEED = {
 
 @pytest.fixture
 def seed_dir(tmp_path):
-    """建好出厂种子 data/config.yaml，返回（根目录, 种子路径）。
+    """建好出厂种子 data/config.json，返回（根目录, 种子路径）。
 
-    v3.5 起 ConfigStore 运行时**不读** YAML，种子只在显式传 seed_path 时使用
-    （构建工具与测试场景），因此这里把路径单独交给 fixture 使用者。
+    v3.5 起 ConfigStore 运行时**不读**种子文件，它只在显式传 seed_path 时使用
+    （构建工具与测试场景）；v3.8 起种子与导入导出**一律是 JSON**。
     """
     data = tmp_path / 'data'
     data.mkdir()
-    seed = data / 'config.yaml'
-    seed.write_text(yaml.dump(SEED, allow_unicode=True), encoding='utf-8')
+    seed = data / 'config.json'
+    seed.write_text(json.dumps(SEED, ensure_ascii=False), encoding='utf-8')
     return tmp_path, seed
 
 
@@ -93,7 +92,7 @@ def test_seed_missing_falls_back_to_defaults(tmp_path):
 def test_broken_seed_does_not_crash(tmp_path):
     """种子文件损坏时静默退回默认值，不能因配置问题让程序起不来。"""
     (tmp_path / 'data').mkdir()
-    (tmp_path / 'data' / 'config.yaml').write_text('::: not yaml :::\n- [',
+    (tmp_path / 'data' / 'config.json').write_text('{ 这不是合法 JSON',
                                                    encoding='utf-8')
     store = ConfigStore(str(tmp_path))
     assert store.load()['role'] == DEFAULTS['role']
@@ -181,35 +180,37 @@ def test_save_requires_dict(store):
         store.save(['not', 'a', 'dict'])
 
 
-# ---------- 导入导出 ----------
+# ---------- 导入导出（v3.8 起只有 JSON） ----------
 
 def test_export_import_roundtrip(store, tmp_path):
     store.set('role', '钟离')
     store.set_frame_scale('钟离', 70, 1.1)
-    yml = store.export_yaml(str(tmp_path / 'out.yaml'))
     jsn = store.export_json(str(tmp_path / 'out.json'))
 
-    with open(yml, encoding='utf-8') as f:
-        assert yaml.safe_load(f)['role'] == '钟离'
     with open(jsn, encoding='utf-8') as f:
         assert json.load(f)['frame_scale']['钟离'] == [70, 1.1]
 
-    target_dir = tmp_path / 'target'
-    (target_dir / 'data').mkdir(parents=True)
-    (target_dir / 'data' / 'config.yaml').write_text(
-        yaml.dump(SEED, allow_unicode=True), encoding='utf-8')
-    target = ConfigStore(str(target_dir))
+    target = ConfigStore(str(tmp_path / 'target'))
     report = target.import_file(jsn, replace=True)
     assert report['mode'] == 'replace'
     assert target.load()['role'] == '钟离'
     assert target.frame_scale('钟离') == [70, 1.1]
 
 
+def test_export_yaml_removed(store, tmp_path):
+    """v3.8：export_yaml 已彻底删除，面板上也没有「导出 YAML」了。
+
+    断言「方法不存在」而不是只测JSON 路径——否则将来有人把
+    export_yaml 加回来悄悄恢复了旧格式，也不会有测试报警。
+    """
+    assert not hasattr(ConfigStore, 'export_yaml')
+
+
 def test_import_merge_keeps_existing(store, tmp_path):
-    src = tmp_path / 'src.yaml'
-    src.write_text(yaml.dump(
+    src = tmp_path / 'src.json'
+    src.write_text(json.dumps(
         {'role': '魈', 'frame_scale': {'早柚': [99, 2.0], '新角色': [60, 1.0]}},
-        allow_unicode=True), encoding='utf-8')
+        ensure_ascii=False), encoding='utf-8')
     report = store.import_file(str(src), replace=False)
     assert report['mode'] == 'merge'
     # 合并模式：标量被更新，但已有人物设置保留
@@ -219,9 +220,9 @@ def test_import_merge_keeps_existing(store, tmp_path):
 
 
 def test_import_replace_overwrites(store, tmp_path):
-    src = tmp_path / 'src.yaml'
-    src.write_text(yaml.dump({'role': '魈', 'frame_scale': {'魈': [60, 1.0]}},
-                             allow_unicode=True), encoding='utf-8')
+    src = tmp_path / 'src.json'
+    src.write_text(json.dumps({'role': '魈', 'frame_scale': {'魈': [60, 1.0]}},
+                              ensure_ascii=False), encoding='utf-8')
     store.import_file(str(src), replace=True)
     assert store.load()['role'] == '魈'
     # 覆盖模式：早柚不在新配置里，应被移除
@@ -229,39 +230,55 @@ def test_import_replace_overwrites(store, tmp_path):
 
 
 def test_import_reports_unknown_keys(store, tmp_path):
-    src = tmp_path / 'src.yaml'
-    src.write_text(yaml.dump({'role': '魈', '脏键': 1}, allow_unicode=True),
+    src = tmp_path / 'src.json'
+    src.write_text(json.dumps({'role': '魈', '脏键': 1}, ensure_ascii=False),
                    encoding='utf-8')
     report = store.import_file(str(src), replace=True)
     assert report['unknown_keys'] == ['脏键']
     assert '脏键' not in store.load()
 
 
-def test_import_json_content_with_yaml_suffix(store, tmp_path):
-    """后缀不可靠时按内容嗅探（有人会把 JSON 存成 .yaml）。"""
-    src = tmp_path / 'conf.yaml'
+def test_import_json_content_with_other_suffix(store, tmp_path):
+    """后缀不是 .json 也照样按 JSON 读（有人会把配置存成 .txt/.conf）。"""
+    src = tmp_path / 'conf.txt'
     src.write_text(json.dumps({'role': '魈', 'frame_scale': {}}, ensure_ascii=False),
                    encoding='utf-8')
     store.import_file(str(src), replace=True)
     assert store.load()['role'] == '魈'
 
 
+@pytest.mark.parametrize('name', ['old.yaml', 'old.yml'])
+def test_import_yaml_is_rejected(store, tmp_path, name):
+    """v3.8：YAML 不再支持，且必须**明确报错**而不是静默按 JSON 读。
+
+    静默兼容一个已退役的格式是危险的：YAML 长得像 JSON 的超集，
+    真按 JSON 解析多半直接报「格式无法识别」，但若文件碰巧是
+    JSON 合法 YAML，用户会以为导入了 YAML 却被改写成 JSON——
+    所以这里要求给出**明确的**、提到 JSON 的错误信息。
+    """
+    src = tmp_path / name
+    src.write_text('role: 魈\nframe_scale: {}\n', encoding='utf-8')
+    with pytest.raises(ValueError) as exc:
+        store.import_file(str(src))
+    assert 'YAML' in str(exc.value) and 'JSON' in str(exc.value)
+
+
 def test_import_errors(store, tmp_path):
     with pytest.raises(FileNotFoundError):
-        store.import_file(str(tmp_path / 'nope.yaml'))
-    # 注意：内容必须是真正无法解析的 YAML；'::: x [' 之类会被解析成 dict 而非报错
-    bad_yaml = tmp_path / 'bad.yaml'
-    bad_yaml.write_text('::: not yaml :::\n- [', encoding='utf-8')
-    with pytest.raises(ValueError):
-        store.import_file(str(bad_yaml))
+        store.import_file(str(tmp_path / 'nope.json'))
     bad_json = tmp_path / 'bad.json'
     bad_json.write_text('{oops', encoding='utf-8')
     with pytest.raises(ValueError):
         store.import_file(str(bad_json))
-    empty = tmp_path / 'empty.yaml'
+    empty = tmp_path / 'empty.json'
     empty.write_text('', encoding='utf-8')
     with pytest.raises(ValueError):
         store.import_file(str(empty))
+    # 内容是合法 JSON 但不是配置对象（这里是数组）也要拒绝
+    not_obj = tmp_path / 'arr.json'
+    not_obj.write_text('[1, 2]', encoding='utf-8')
+    with pytest.raises(ValueError):
+        store.import_file(str(not_obj))
 
 
 def test_reset_to_seed(store):

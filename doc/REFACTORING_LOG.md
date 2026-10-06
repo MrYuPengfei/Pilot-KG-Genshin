@@ -850,3 +850,228 @@ def _find_candidate_row(self, text):
   与「完整按下→释放→双击→再交互序列无 grab 警告」。
 - **有效性已验证**：退回两处修复后 **6 项如期失败**。
 - **总计 156（轻量）+ 8（GUI 切换）= 164 项通过**；核心模块 pyflakes 零告警。
+
+### 补充 8（v3.7 深夜）：修复「重新构建后图谱编辑丢失」+ CSV 模块重组
+
+用户反馈四件事：① 在知识图谱页编辑后数据没保存到数据库，新安装包仍是旧数据；
+② CSV 导入导出对话框的取消/退出逻辑不对；③ CSV 按钮应在素材管理页；
+④ 素材管理页按钮应大小一致对齐。另需消除 `'float | int | Any' 不支持格式规范` 警告。
+
+#### ① 图谱编辑「丢失」——真凶是构建流程，不是存储
+
+**先验证存储层**（排除误判）：`KGStore.add_node/add_edge` 都用 `with self._conn:`
+事务写入，进程退出后另开连接读磁盘确认**确实落盘**（2 节点 / 1 关系）。
+存储层没问题。
+
+**真正的根因在构建流程**。`kg.db` / `config.db` 既是「出厂产物」又是**用户本机状态**——
+程序里新增的图谱实体、改过的名字、调好的帧率与缩放，全都写在这两个库里。
+而 v3.5 定的流程是「打包前先跑 `build_databases.py --force`」，
+**`--force` 会用 `data/csv`、`data/config.yaml` 静默覆盖它们**。
+于是每次重新构建，用户的编辑都被抹掉，新安装包自然还是旧图谱。
+
+**修法（三层）**：
+
+1. `build_databases.py` 的提示语改成明确的**打包正确用法**：
+   > 日常打包**不加 `--force`**——库已存在时只检查不重建，编辑因此被保留。
+   > 确认要丢弃现有内容才加 `--force`。
+   （`build()` 开头、跳过分支的提示、argparse 的 `description`/`epilog` 都改了）
+2. `--force` 时**自动备份**到 `kg.db.bak-<时间戳>` / `config.db.bak-<时间戳>`，
+   返回值带 `backup` 路径；新增 `--no-backup` 可关闭。报告里明确提示
+   「程序里编辑过的内容在里面，重建会丢弃」。
+3. `.gitignore` 加 `*.db.bak-*` 与 `*.db.building`。
+4. 部署文档加醒目警告框 + README 开发命令段加注释；故障排查表里两处
+   `--force` 也改成不加（库不存在时 `build_databases.py` 本就会生成）。
+
+**顺带修一个我自己引入的 bug**：`build_config` 里原有 `finally: import shutil`，
+与顶部模块级 `import shutil` 冲突——Python 视其为函数局部变量，
+未执行到就 `UnboundLocalError`。已删掉局部的（顶部已有）。
+
+**测试**：新增 4 项（备份含用户编辑内容、库不存在时无需备份、config.db 同样备份、
+`--no-backup` 生效），已验证退回后失败。
+
+#### ② CSV 对话框逻辑重写
+
+**原逻辑的毛病**：`_on_kg_import` 先弹一个自建的三按钮 `QMessageBox`
+（目录 / 单文件 / 取消），选完再弹 `_kg_do_import` 的 Yes/No/Cancel——
+**两层模态框嵌套**，且第二层用「确定 = 合并，取消 = 覆盖」表述，
+「取消」既是取消操作又表示覆盖，语义混乱；窗口右上角关闭也走 `else` 分支不明确。
+
+**改为单层、语义明确**：
+
+- 第一层：用 `addButton` + `setInformativeText` 说明两种来源的差别，
+  补 `StandardButton.Cancel` 并设为默认按钮；**关窗与取消同义**（都不导入）。
+- 第二层：合并 / 覆盖 / 取消三个按钮，**「合并」是默认**（安全的那条路），
+  覆盖标为 `DestructiveRole`（红色警示）。`informativeText` 讲清两者差异。
+- 判别一律用 `box.clickedButton() is <btn>`，不用 `exec()` 的返回码；
+  文件对话框取消（空路径）也单独判空返回。
+
+#### ③ CSV 按钮迁到「素材管理」页
+
+- 知识图谱页顶部移除三个按钮，改为一行提示「数据导入导出见『素材管理』页」。
+- 素材管理页新增「知识图谱数据」分组：图谱存储统计 + 导入图谱 CSV / 导出图谱 CSV /
+  重新载入图谱。统计走新的 `_update_kg_stat()`，图谱载入/变化时自动同步
+  （未载入时只提示位置，不强制打开大库）。
+
+#### ④ 按钮尺寸全页面统一
+
+原先只有「素材管理」页统一过，其余三页都是各自的默认尺寸：
+
+| 页面 | 原状态 |
+| --- | --- |
+| 人物管理 | 233×20 与 232×20（**差 1px，肉眼可见的不对齐**） |
+| 音乐管理 | 640×480（撑满整行） |
+| 知识图谱 | 640×480 |
+
+**做法**：把 `BTN_W, BTN_H` 提到**模块级常量**（原来只是 `_build_assets_tab`
+的局部变量，别的页用不了），标注为 `int`；给全部 17 个按钮
+（人物 3 + 音乐 3 + 素材 11 + 图谱 7 中的按钮，另含搜索框「定位」）加
+`setFixedSize`，每行末尾补 `addStretch(1)`。实测**四个页面全部 132×32，只有一种尺寸**。
+
+#### ⑤ 消除 `float | int | Any` 格式警告
+
+这个警告来自**类型检查器**（IDE），不是 Python 运行时。定位方法：先用
+`ast` 扫出所有「带格式说明符的 f-string」，再逐个核对值的来源。
+
+真凶 3 处（另 3 处在 `asset_exporter._human_size`）：
+
+| 位置 | 表达式 | 问题 |
+| --- | --- | --- |
+| `manager_panel._kg_update_status` | `s['db_size_mb']:.1f` | `float \| None` |
+| `manager_panel.refresh` | `s['db_size_mb']:.1f` | 同上 |
+| `manager_panel.refresh` | `cs['db_size_kb']:.0f` | 同上 |
+| `asset_exporter._human_size` | `n / 1024:.0f` | `int \| float` |
+
+`resource_store.stats()` 的 `size_mb` 在**文件后端下是 `None`**（没有库文件），
+类型就是 `float | None`；`config_store.stats()` 的 `size_kb` 同理。
+**修法**：先判空取出到局部变量，再 `float(...)` 显式转换后格式化；
+`_human_size` 开头 `n = float(n)`。修复后 ast 复查 6 处格式化的值都已是明确 float。
+
+> 注意：这不是「编译器语法警告」（那类 v3.7 白天已清零，这里 34 个文件仍为 0 条），
+> 而是 IDE 类型检查提示。运行时加 `-W error` 验证过：干净。
+
+**测试总计：160（轻量）+ 8（GUI 切换）= 168 项通过**；核心模块 pyflakes 零告警。
+
+## 版本 3.8：面板主窗口化、伙伴退到托盘、配置改 JSON、帮助外置、卸载修复（2026-10-06）
+
+### 面板：新增「窗口与状态」标签页
+
+- **动机**：面板原先是 `Pilot` 的子弹窗，Windows 把它并进伙伴那个「无边框置顶」
+  窗口的任务栏分组，用户在任务栏上根本找不到它；而且面板**没有任何窗口状态入口**，
+  不能最小化、不能最大化。
+- **窗口命令放哪**：先试过放菜单栏，用户要求「不要 menus，改成新标签页」；
+  随后又试过「把五个标签页全部转入 menus」，最终**按用户要求撤回菜单方案**，
+  恢复标签页并新增一个「窗口与状态」页承载窗口命令。
+- **实现**：`QTabWidget` 仍是中央控件（六个标签页）；
+  窗口页上半部分是命令按钮（最小化 / 最大化·还原 / 全屏·退出全屏 / 隐藏面板），
+  下半部分是「当前状态」（窗口状态、当前伙伴、资源库、版本）；
+  伙伴显隐用 `QCheckBox` 而非按钮——它是**状态**而非动作。
+- ⚠️ **不建菜单栏**：`menuBar()` 一旦被调用，菜单与标签两套导航会并存并互相打架。
+  `tests/test_v38.py::test_panel_keeps_tabs_and_has_no_menubar` 锁住这一点。
+- 另加 `Ctrl+1` ~ `Ctrl+6` 快速切换六个标签页（`_build_shortcuts()`，
+  同样必须在所有标签页建好之后调用，否则会绑错页）。
+- 顺带修掉一个真实缺陷：原先各处直接调 `setWindowOpacity`，
+  从托盘隐藏伙伴后勾选框仍显示「已勾选」。现新增
+  `Pilot.set_visible(visible)` 作为**显隐唯一入口**，末尾回调面板 `_sync_window_state()`。
+
+### 面板：QDialog → QMainWindow
+
+- **动机**：面板原先是 `Pilot` 的子弹窗，Windows 把它并进伙伴那个「无边框置顶」
+  窗口的任务栏分组，用户在任务栏上根本找不到它；而且面板没有任何窗口状态入口，
+  不能最小化、不能最大化。
+- **改法**：`super().__init__(None)` + 显式
+  `setWindowFlags(Qt.Window | Close | Minimize | Maximize ButtonHint)`。
+  **不把 pilot 作为 Qt 父窗口**是任务栏能独立成条目的关键；
+  pilot 改由 `self.pilot` 属性引用（原来两者是 Qt 父子关系）。
+- **配套**：`changeEvent` 里按 `WindowStateChange` 同步「窗口与状态」页的
+  按钮文案与勾选；`keyPressEvent` 里 **Esc 退出全屏**（全屏时标签页与标题栏
+  控件都可能被盖住，没这个出口用户会被困住）。
+- **关闭语义改为「隐藏」**：`closeEvent` 里 `event.ignore()` + `hide()`，
+  且**不再调 `pilot.on_manager_closed()`**——那会把 `_panel` 置空，
+  下次打开会新建实例，旧实例连同资源一起泄漏（关闭一次就白丢一次已填的表单
+  和已加载的图谱）。真正销毁只发生在 `Pilot.quit()`
+  （`setAttribute(WA_DeleteOnClose, True)` + `close()` + `deleteLater()`）。
+
+### 伙伴本体：加 Qt.Tool，不进任务栏
+
+- 原先只有 `FramelessWindowHint`，Windows **仍会**给伙伴创建一个任务栏按钮，
+  而它不可最小化、点它只是闪一下伙伴——一个点不动的空占位。
+- `Qt.Tool` 在 Windows 上映射为 `WS_EX_TOOLWINDOW`，才真正不进任务栏与 Alt+Tab。
+- 与上一条方向相反（一处要独立成条目、一处要彻底消失），**改任一处都要重读这两段**。
+- 另设 `applicationName` / `applicationDisplayName`，让任务栏与 Alt+Tab 显示中文名。
+
+### 配置：只用 JSON
+
+- 删除 `ConfigStore.export_yaml` 与 YAML 解析路径；`_read_yaml` → `_read_json`、
+  `_seed_from_yaml` → `_seed_from_file`；种子迁为 `data/config.json`（30 个人物登记）。
+- **`PyYAML` 从 `pyproject.toml` / `requirements.txt` / `uv.lock` 移除**，
+  打包产物里不再有 `yaml/` 目录。
+- `import_file` 遇到 `.yaml` / `.yml` **明确报错**并提示另存为 JSON，
+  而不是静默按 JSON 解析——静默兼容已退役的格式会让用户以为导入成功、实际写进了错结构。
+- 属性名 `yaml_path` 作为 `seed_path` 的兼容别名保留（旧代码/测试可能仍引用）。
+
+### 帮助文档外置为 res/help.html
+
+- `manager_panel.py` 里约 270 行 HTML 整体搬进 `res/help.html`（13.5KB，含 CSS），
+  `load_help_html(base_dir)` 启动时读取并替换 `{{APP_VERSION}}` 等占位符。
+- **占位符用双花括号**：文件里有 CSS（`body { ... }`），单花括号会在替换时把样式吃掉。
+- ⚠️ **候选路径第三项是 `here/res/help.html`，不是「here 的父目录/res」**——
+  写错时开发态永远读不到文件，且因为有兜底提示**不报错**，只是帮助页空白。
+  这个 bug 真的发生过一次，靠运行时打印候选路径才抓到。
+- spec datas 与 `verify_package.py` 都已覆盖该文件（缺它属静默故障，必须拦住）。
+- **同日重写内容**：从「按页面罗列」改为「按主题组织」的十节结构——
+  ① 程序是怎么工作的（窗口与托盘）② 管理面板七个菜单 ③ 导入导出素材
+  ④ 知识图谱 ⑤ 配置（JSON）⑥ 数据文件/备份与迁移 ⑦ 卸载与清理
+  ⑧ 常见问题排查 ⑨ 版本变更记录 ⑩ 许可与素材版权；开头加目录锚点跳转，
+  并把配置 JSON 的顶层键名列成表。
+
+### 知识图谱：确认即时落盘 + 修复升级覆盖
+
+- **先核实，不臆改**：「每次增删改都保存到 kg.db」这个需求，实测发现**存储层本来
+  就是即时提交的**——`add_node` / `update_node` / `delete_node` / `add_edge` /
+  `update_edge` / `delete_edge` 每个写方法都用 `with self._conn:` 包裹，
+  块退出即 commit；`update_edge_touching` / `delete_edge_touching` 只做方向识别后
+  委托给它们。也确认了没有任何地方绕过存储层直接改内存索引
+  （`kg_view.py` 是纯展示，不含写操作）。故**没有改这部分逻辑**。
+- **但找到了真正的丢数据原因**：`setup.iss` 的 `[Files]` 用
+  `recursesubdirs` 批量复制 `_internal\*`，只把 `config.db` 列进 `Excludes`，
+  **`kg.db` 每次升级都被无条件覆盖**——用户的图谱编辑其实存进了 kg.db，
+  却在装新版本时被安装器清空。现把 `kg.db` 也移出批量复制，
+  改为与 `config.db` 同样的 `onlyifdoesntexist`。
+- **补 7 条回归测试**（`tests/test_kg_store.py`）：新增 / 改 / 删实体、
+  新增关系、改关系（含换对端）/ 删关系、整目录导入 CSV，
+  以及「升级不得覆盖 kg.db」的脚本断言。
+  关键写法：**关掉连接重开一个新实例再查**，而不是查内存索引——
+  只查 `store.nodes` 是测不出漏提交的（内存里一直有，文件里可能没有）。
+- 顺带记下测试断言的两处陷阱：`_edges` 是 `set of ((类型,名), 关系名, (类型,名))`
+  三元组（不是五元组）；导入关系 CSV 时对端实体会被**自动补建**，
+  所以 2 人物 + 2 关系的结果是 **4** 个节点而不是 2。
+
+### 卸载：修复「卸载不干净」
+
+- **根因**：`{app}` 目录非空时 Inno **不会删除它**，而程序运行期产生的文件
+  （含用户导出的素材、图谱编辑）不在安装登记之列；再叠加程序没关、文件被占用，
+  删不掉。实测机器上就留着一个 0 文件的空目录。
+- **改法**：`[UninstallRun]` 先 `taskkill /F` 结束进程；`[UninstallDelete]` 增加
+  `Type: filesandordirs; Name: "{app}"` 兜底整目录删除；`[InstallDelete]` 清理旧版残留
+  （`dist_data` / `data` / `GenshinKG` / `config.yaml` 等）。
+- **可选保留用户数据**：卸载前询问是否保留三个 `.db`，选「是」则**拷到 `{app}` 之外**
+  （`%APPDATA%\原神桌面伙伴-备份`）再清空目录。
+  ⚠️ **不能用 `UninstallAllowUserDataKeep`**——该指令在本机 Inno Setup 6.3.3 中
+  并不存在（官方指令表里没有），写进脚本直接编译失败。
+- 新增 `AppMutex`，配合程序侧 `create_app_mutex()` 单实例互斥量，
+  让安装/卸载能可靠判断程序是否在运行（名字写死在两处，已用测试锁住一致性）。
+
+### 测试与验收
+
+- `uv run --with pyflakes`：核心模块 + tools + tests **零告警**。
+- `pytest -q`：**185 项全通过**（原 171 + `tests/test_v38.py` 14）。
+- `tools/smoke_kg_panel.py` 离屏冒烟 **SMOKE OK**（QMainWindow 下真实编辑/导入/导出链路正常）。
+- 运行时验证面板：`Qt.Window` 置位、父窗口 `None`、最大化/还原/全屏/最小化
+  状态与菜单文案均正确同步、close 后隐藏且实例仍可用。
+- `build_databases.py`（不加 `--force`）→ 三个库保留；PyInstaller 打包 →
+  日志出现 `Building COLLECT because COLLECT-00.toc is non existent`（未复用缓存）；
+  `verify_package.py` 退出码 0；产物 exe 离屏跑 25 秒**输出为空**。
+- 完整安装链路：静默安装到隔离目录 → 目录内 CSV/YAML/JSON 计数为 0、无 `data/`、
+  `help.html` 就位 → 已安装程序离屏跑 25 秒输出为空 → 静默卸载后
+  **`{app}` 目录本身消失（0 残留）**，且「保留数据」路径确实产出了
+  `%APPDATA%` 下的三个 `.db` 备份。

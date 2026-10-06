@@ -1,6 +1,6 @@
 """命令行导入第三方素材包：python tools/import_assets.py <素材包目录或zip> [assets.db 路径]
 
-v3.4：人物登记改为写入配置库 config.db（不再改写 config.yaml）。
+v3.4：人物登记改为写入配置库 config.db（不再改写任何文本配置文件）。
 """
 
 import os

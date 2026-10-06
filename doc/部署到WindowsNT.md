@@ -1,6 +1,6 @@
 # 部署到 Windows（PyInstaller + Inno Setup 6）
 
-适用版本：**v3.7**。整体链路：`pilot.py` → PyInstaller 打包成 `dist/原神桌面伙伴/` → Inno Setup 编译 `setup.iss` 生成安装向导 `inno_build/原神桌面伙伴安装向导.exe`。
+适用版本：**v3.8**。整体链路：`pilot.py` → PyInstaller 打包成 `dist/原神桌面伙伴/` → Inno Setup 编译 `setup.iss` 生成安装向导 `inno_build/原神桌面伙伴安装向导.exe`。
 
 | 环节 | 工具 | 产物 | 典型耗时 |
 | --- | --- | --- | --- |
@@ -14,11 +14,12 @@
 
 | 文件 | 字段 | 作用 |
 | --- | --- | --- |
-| `manager_panel.py` | `APP_VERSION = '3.7'` | 面板标题、帮助页显示的版本号 |
-| `setup.iss` | `#define AppVersion "3.7"` | 安装包属性、"新版本"提示 |
-| `pyproject.toml` | `version = "3.7.0"` | 包元数据（可带第三位补丁号） |
+| `manager_panel.py` | `APP_VERSION = '3.8'` | 面板标题、状态栏、帮助页显示的版本号 |
+| `setup.iss` | `#define AppVersion "3.8"` | 安装包属性、"新版本"提示 |
+| `pyproject.toml` | `version = "3.8.0"` | 包元数据（可带第三位补丁号） |
 
-> `pyproject.toml` 用三段式 `3.7.0`，另两处用两段式 `3.7`——这是有意的，测试里只校验两者**前缀一致**。
+> `pyproject.toml` 用三段式 `3.8.0`，另两处用两段式 `3.8`——这是有意的，测试只校验两者**前缀一致**
+> （`tests/test_v38.py::test_version_three_places_match`）。
 > 三处漏改不会导致构建失败，但会让用户看到互相矛盾的版本号。
 
 ---
@@ -47,11 +48,27 @@ uv run python tools/build_assets_db.py
 #   可选参数：--output 指定输出路径、--img-dir/--music-dir 换目录名、-v 打印进度
 #   预期输出：完成：9820 条资源 -> ...\assets.db（459.5 MB）
 
-# ② 知识图谱库（data/csv/*.csv → kg.db）+ ③ 出厂配置库（data/config.yaml → config.db）
+# ② 知识图谱库（data/csv/*.csv → kg.db）+ ③ 出厂配置库（data/config.json → config.db）
 uv run python tools/build_databases.py
 #   可选参数：--only kg|config|all、--force 强制重建、--check 只校验不写入
-#   预期输出：kg.db 1911 节点 / 7356 关系（2.9 MB）；config.db 出厂角色 + 30 个人物登记
+#   预期输出：kg.db 已存在，跳过重建：1911 节点 / 7356 关系；config.db 30 个人物登记
 ```
+
+> ⚠️ **打包时不要加 `--force`**（v3.7 起请务必注意）。
+>
+> `kg.db` 与 `config.db` 既是「出厂产物」又是「用户本机状态」——你在程序里
+> 新增的图谱实体、改过的名字、调好的帧率与缩放，**都写在这两个库里**。
+> 一旦用 `--force` 重建，它们会被 `data/csv`、`data/config.json` **静默覆盖**，
+> 表现为「重新构建后新安装包里还是旧数据」。
+>
+> 正确做法：**直接构建**（不加 `--force`）——库已存在时只检查不重建，
+> 你的编辑因此被保留。只有确认要丢弃现有内容、从 CSV/YAML 重新生成时才加
+> `--force`，且它会**自动备份**到 `kg.db.bak-<时间戳>` / `config.db.bak-<时间戳>`。
+>
+> ```shell
+> uv run python tools/build_databases.py            # ✓ 日常打包用这个
+> uv run python tools/build_databases.py --force    # ✗ 会覆盖编辑（但有备份）
+> ```
 
 打包前自检（三个库都必须存在且非空）：
 
@@ -64,7 +81,7 @@ ls -la assets.db kg.db config.db
 | --- | --- | --- |
 | `assets.db` | `png/` + `music/` | 资源（帧、语音、BGM） |
 | `kg.db` | `data/csv/*.csv` | 知识图谱，1911 节点 / 7356 关系 |
-| `config.db` | `data/config.yaml` | 出厂配置（当前人物、各人物帧率与缩放） |
+| `config.db` | `data/config.json` | 出厂配置（当前人物、各人物帧率与缩放） |
 
 > **`config.db` 是唯一「装完就会被用户改写」的库**：用户改设置后它就是本机状态。
 > `setup.iss` 用 `onlyifdoesntexist` 安装它，**升级不会覆盖用户配置**；
@@ -129,7 +146,7 @@ ls -la "dist/原神桌面伙伴/_internal/assets.db" \
        "dist/原神桌面伙伴/_internal/config.db" \
        "dist/原神桌面伙伴/_internal/icon256.ico"
 # 安装包不应含任何 CSV / YAML（v3.5 硬性要求）
-find "dist/原神桌面伙伴/_internal" -maxdepth 2 \( -name "*.csv" -o -name "*.yaml" -o -name "*.yml" \) \
+find "dist/原神桌面伙伴/_internal" -maxdepth 2 \( -name "*.csv" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) \
   | head -5 | grep . && echo "异常：包内存在 CSV/YAML" || echo "OK  包内无 CSV/YAML"
 ls -d "dist/原神桌面伙伴/_internal/data" 2>/dev/null && echo "异常：包内存在 data/" || echo "OK  无 data/"
 ```
@@ -203,28 +220,35 @@ ls "$LOCALAPPDATA/Programs/原神桌面伙伴/_internal/data/csv" | wc -l       
 > **卸载是异步的**：直接 `ls` 可能早于卸载完成而误判「目录还在」，脚本里应轮询确认目录消失。
 > 实测卸载约 3 秒完成，安装约 1.5 分钟（解压 500MB）。
 
-## 本次构建实测记录（v3.7，2026-10-05 17:45~17:56 全链路实测）
+## 本次构建实测记录（v3.7，2026-10-05 22:02~22:09 全链路，含当日全部修复）
 
 | 环节 | 结果 |
 | --- | --- |
-| `uv run pytest -q` | **140 passed**（132 轻量 + 8 GUI 切换） |
+| `uv run pytest -q` | **168 passed**（160 轻量 + 8 GUI 切换） |
 | 清理 `build`/`dist` | PowerShell `Remove-Item -Recurse -Force`（bash 的 `rm -rf` 会被安全闸门拦） |
-| 前置构建 | `uv run python tools/build_databases.py --force` → `kg.db` 1911 节点 / 7356 关系（2.9MB）、`config.db` 出厂「早柚」+ 30 人登记（28KB）；`--check` 通过 |
-| PyInstaller（onedir） | 成功，**3 分 16 秒**，日志为 `Building COLLECT because COLLECT-00.toc is non existent`（全新构建，未复用缓存） |
+| 前置构建 | `uv run python tools/build_databases.py`（**不加 `--force`**）→ 正确**跳过重建**并提示「`--force` 会用 CSV 覆盖并丢弃你的编辑」：`kg.db` 1911 节点 / 7356 关系（2,998,272 字节）、`config.db` 30 人登记（28,672 字节）；`--check` 通过。三个库文件时间戳保持构建前的原值（**未被覆盖**） |
+| PyInstaller（onedir） | 成功，**2 分 22 秒**，日志为 `Building COLLECT because COLLECT-00.toc is non existent`（全新构建，未复用缓存） |
 | `tools/verify_package.py` | **全绿**（六组检查：目录结构 / 三库大小下限 / 无 CSV·YAML·data / 图标 / PYZ 模块 / 库内容抽样） |
 | PYZ 模块校验 | `manager_panel` / `resource_store` / `asset_importer` / `config_store` / `kg_store` / `kg_editor` / `kg_view` / `tools.build_assets_db` 全部命中；`tools.build_databases`、`tools.build_data_pack` **未进包**（符合预期） |
 | `_internal` 数据校验 | `assets.db` 483,860,480 字节（461.4MB）、`kg.db` 2,998,272 字节（1911 节点 / 7356 关系 / `schema_version=1`）、`config.db` 28,672 字节、`icon256.ico` 均就位 |
 | **包内 CSV/YAML 检查** | **数量 = 0**，且**无 `data/` 目录**（v3.5 硬性要求达成） |
-| 产物 exe 离屏运行 | 存活 25 秒正常，并读写了自己的 `_internal/config.db` |
-| Inno Setup 编译 | 成功，**168 秒** |
-| 安装包 | `inno_build/原神桌面伙伴安装向导.exe`，**503,157,495 字节（479.6 MB）** |
-| 静默安装 | 成功（**80 秒**）；安装目录三库齐备，**CSV/YAML 数量 = 0、无 `data/`** |
-| 已安装程序离屏启动 | 存活 25 秒正常；图谱 1911 节点 / 7356 关系，人物登记 28 人 |
-| **升级保护复验** | 安装目录里 `role` 为「优菈」（上一轮安装遗留的用户配置）而非出厂「早柚」——`onlyifdoesntexist` 再次生效 |
+| 产物 exe 离屏运行 | 存活 25 秒正常，**输出零 Qt 警告**；三个库在 `_internal` 内就位 |
+| Inno Setup 编译 | 成功，**125.2 秒** |
+| 安装包 | `inno_build/原神桌面伙伴安装向导.exe`，**503,155,522 字节（479.6 MB）** |
+| 静默安装 | 成功（**71 秒**）；安装目录三库齐备，**CSV/YAML 数量 = 0、无 `data/`** |
+| 已安装程序离屏启动 | 存活 25 秒正常、**输出零 Qt 警告** |
 | 静默卸载 | 成功；文件数归 0（卸载程序异步，需轮询约 10~30 秒） |
+| 冒烟 + 静态检查 | `tools/smoke_kg_panel.py` **SMOKE OK**；核心模块 + tools + tests **pyflakes 零告警** |
 
-> 上一轮（v3.5）还实测过「删除 `_internal/config.db` 后 exe 自行重建 28,672 字节配置库
+> **为什么这次特别关注「零 Qt 警告」**：v3.7 当日修掉的四类问题
+> （图谱双击 `Internal C++ object already deleted`、编辑对话框 `itemFromIndex(str)`、
+> 画布 `ungrabMouse: not a mouse grabber`、启动时托盘 `No Icon set`）
+> 都会在**运行时输出到 stderr**。产物 exe 与已安装程序各跑 25 秒、输出为空，
+> 说明这些修复确实进了包。
+>
+> 上一轮（17:45 那次）还实测过「删除 `_internal/config.db` 后 exe 自行重建 28,672 字节配置库
 > （`role=七七` + 按 `assets.db` 补齐 28 人）」，证明运行时确实不依赖任何 YAML —— 该结论仍然有效。
+> 「升级保护」（`onlyifdoesntexist`）也已在更早几轮实测确认。
 
 > **打包前建议先跑静态检查**（v3.7 起项目零告警基线）：
 > ```shell
@@ -252,8 +276,8 @@ ls "$LOCALAPPDATA/Programs/原神桌面伙伴/_internal/data/csv" | wc -l       
 | --- | --- | --- |
 | 产物缺少新模块或新数据，但构建显示成功 | 复用了旧 Analysis 缓存 | 手动删 `build/`、`dist/`、`%LOCALAPPDATA%\pyinstaller` 后重打（步骤 2、3.1） |
 | 安装后启动即崩，提示缺 `assets.db` | 打包时 `--add-data` 漏了或 DB 未生成 | 先跑 `build_assets_db.py`，再补 `--add-data "assets.db;."` |
-| 知识图谱页空白 / 搜索无结果 | `kg.db` 未随包分发或为空 | 跑 `uv run python tools/build_databases.py --only kg --force` 重建后重新打包；确认 `_internal/kg.db` 约 2.9MB |
-| 配置被重置 / 当前人物不对 | `config.db` 未随包分发，程序回退到内置默认值（七七 + 按资源库补齐登记） | 跑 `uv run python tools/build_databases.py --only config --force` 重建后重新打包 |
+| 知识图谱页空白 / 搜索无结果 | `kg.db` 未随包分发或为空 | 跑 `uv run python tools/build_databases.py --only kg`（库不存在时会自动生成）后重新打包；确认 `_internal/kg.db` 约 2.9MB |
+| 配置被重置 / 当前人物不对 | `config.db` 未随包分发，程序回退到内置默认值（七七 + 按资源库补齐登记） | 跑 `uv run python tools/build_databases.py --only config` 后重新打包 |
 | 面板/托盘里没有新导入的人物 | `assets.db` 不可写 | 装到了 `Program Files`；改装到 `%LOCALAPPDATA%\Programs` |
 | 退出后设置没保存 | 同上，配置文件不可写 | 同上；`DefaultDirName` 不要改回 `{commonpf}` |
 | 覆盖安装失败提示文件占用 | 旧进程未退出 | 已配 `CloseApplications=yes`；仍失败则手动结束 `原神桌面伙伴.exe` 后重试 |

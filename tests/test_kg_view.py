@@ -197,9 +197,12 @@ def test_double_click_via_panel_repaint(app):
                     'voices': 1, 'bgms': 1, 'db_size_mb': 1.0}
 
     class _Pilot(QWidget):
-        """ManagerPanel 会把 pilot 当作 QDialog 的 parent，故必须是 QWidget。
+        """pilot 桩：必须是 QWidget。
 
-        所需成员与 tools/smoke_kg_panel.py 的 FakePilot 保持一致。
+        v3.8 起ManagerPanel 是独立的 QMainWindow，**不再**把 pilot 当作 Qt
+        父窗口传入（那会让面板被并进伙伴的任务栏分组）。但面板仍要读取
+        pilot 的 store / config_store / _frames 等属性，故这些成员不能省。
+        成员清单与 tools/smoke_kg_panel.py 的 FakePilot 保持一致。
         """
 
         def __init__(self):
@@ -211,9 +214,6 @@ def test_double_click_via_panel_repaint(app):
             self.audio_player = False
             self._frames = []
             self.index = 0
-
-        def on_manager_closed(self):
-            pass
 
         def set_voice_enabled(self, enabled):
             pass
@@ -232,6 +232,12 @@ def test_double_click_via_panel_repaint(app):
 
         def _rebuild_role_menu(self):
             pass
+
+        def set_visible(self, visible):
+            self.setWindowOpacity(1.0 if visible else 0.0)
+
+        def quit(self):
+            """面板菜单「退出程序」会调用；桩件里什么都不做。"""
 
         def _rebuild_bgm_menu(self):
             pass

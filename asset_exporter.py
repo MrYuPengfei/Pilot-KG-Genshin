@@ -97,6 +97,9 @@ def export_assets(store, out_dir, roles=None, areas=None, as_zip=False,
 
 
 def _human_size(n):
+    # 显式转 float：n 可能是 int（初值 0）或统计累加结果，
+    # 直接用格式说明符在类型检查器下会报「不支持格式规范」
+    n = float(n)
     if n >= 1024 * 1024 * 1024:
         return f'{n / 1024 / 1024 / 1024:.2f} GB'
     if n >= 1024 * 1024:

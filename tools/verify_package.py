@@ -1,4 +1,4 @@
-"""打包产物校验：确认安装包只含三个 .db 与图标，不含任何 CSV / YAML。
+"""打包产物校验：确认安装包只含三个 .db、help.html 与图标，不含任何 CSV / JSON 配置。
 
 配合 `原神桌面伙伴.spec` + `setup.iss` 使用。在**构建完成后**运行：
 
@@ -7,8 +7,8 @@
 逐项检查（任一 FAIL 即退出码 1，便于接 CI）：
   ① 产物目录结构：exe 在根、数据在 _internal
   ② 三个库就位且非空（大小下限校验，挡住「空库/半成品」）
-  ③ **包内不存在任何 CSV / YAML**（v3.5 硬性要求）
-  ④ 图标就位
+  ③ **包内不存在任何 CSV / YAML / JSON**（v3.5 硬性要求，v3.8 扩到 JSON）
+  ④ 图标与**帮助文档 res/help.html** 就位（v3.8：缺它帮助页会显示兜底提示）
   ⑤ 自有模块都在 PYZ 里（pilot 是入口脚本，不在 PYZ，属正常）
   ⑥ 图谱库内容抽样：节点/关系数与表结构
 """
@@ -41,7 +41,7 @@ def check(ok, label, detail=''):
 
 
 def main():
-    print('校验打包产物：安装包应只含三个 .db 与图标，不含 CSV / YAML\n')
+    print('校验打包产物：安装包应只含三个 .db、help.html 与图标，不含 CSV / JSON\n')
 
     print('① 目录结构')
     check(os.path.isfile(os.path.join(DIST, '原神桌面伙伴.exe')),
@@ -57,22 +57,32 @@ def main():
         check(size >= min_size, f'{name} 大小正常',
               f'{size / 1024 / 1024:.1f} MB（下限 {min_size / 1024 / 1024:.0f} MB）')
 
-    print('\n③ 包内不得含 CSV / YAML（v3.5 硬性要求）')
+    print('\n③ 包内不得含 CSV / YAML / JSON（v3.5 硬性要求，v3.8 扩到 JSON）')
     offenders = []
     for base, _dirs, names in os.walk(DIST):
         for n in names:
-            if n.lower().endswith(('.csv', '.yaml', '.yml')):
+            if n.lower().endswith(('.csv', '.yaml', '.yml', '.json')):
                 offenders.append(os.path.relpath(os.path.join(base, n), DIST))
-    check(not offenders, '无 CSV / YAML 文件',
+    check(not offenders, '无 CSV / YAML / JSON 文件',
           f'发现 {len(offenders)} 个：{offenders[:5]}' if offenders else '已确认')
     check(not os.path.isdir(os.path.join(INTERNAL, 'data')), '无 data/ 目录')
     # data/ 的内容已被打进库，这里只确认目录本身没被带进去
     check(not os.path.isdir(os.path.join(DIST, 'data')), '产物根目录无 data/')
 
-    print('\n④ 图标')
+    print('\n④ 图标与帮助文档')
     for icon in ('icon256.ico',):
         check(os.path.isfile(os.path.join(INTERNAL, icon))
               or os.path.isfile(os.path.join(DIST, icon)), f'{icon} 就位')
+    # v3.8：帮助文档已从源码外置为 res/help.html，必须随包分发——
+    # 缺它程序照常运行，但帮助页只会显示「未能载入帮助文件」，属静默故障。
+    help_path = os.path.join(INTERNAL, 'help.html')
+    if check(os.path.isfile(help_path), 'help.html 就位（帮助文档）', help_path):
+        size = os.path.getsize(help_path)
+        check(size > 5000, 'help.html 内容非空', f'{size} 字节')
+        with open(help_path, encoding='utf-8', errors='ignore') as f:
+            head = f.read(4000)
+        check('{{APP_VERSION}}' in head, 'help.html 含版本占位符',
+              '占位符应保留，由程序运行时替换')
 
     print('\n⑤ 自有模块在 PYZ 中')
     toc = os.path.join(BUILD, 'PYZ-00.toc')
@@ -125,7 +135,8 @@ def main():
         for f in _failures:
             print(f'  - {f}')
         return 1
-    print('全部校验通过：安装包 = 程序 + assets.db + kg.db + config.db + 图标，无 CSV/YAML。')
+    print('全部校验通过：安装包 = 程序 + assets.db + kg.db + config.db '
+          '+ help.html + 图标，无 CSV/YAML/JSON。')
     return 0
 
 

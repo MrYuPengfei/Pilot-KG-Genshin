@@ -14,9 +14,41 @@ from config_store import ConfigStore
 from manager_panel import ManagerPanel
 from resource_store import ResourceStore
 
+# 单实例互斥量名字，**必须与 setup.iss 的 AppMutex 完全一致**（含 Global\ 前缀）。
+# 安装/卸载向导据此判断程序是否在运行：没这个互斥量时 Inno 只能靠进程名
+# 匹配，偶尔漏判正在运行的实例，于是文件被占用、删不掉——卸载不干净。
+APP_MUTEX_NAME = r'Global\PilotKG_Genshin_2B18A692_647A_4A78_BAF2_489F44D660B4'
+_app_mutex_handle = None
+
+
+def create_app_mutex():
+    """创建单实例互斥量；已有实例时返回 False。
+
+    非 Windows 平台直接返回 True（走不到这条路径，Qt 的单实例另说）。
+    失败也返回 True：互斥量只是给安装器用的信号，不该因此拦住程序启动。
+    """
+    global _app_mutex_handle
+    if os.name != 'nt':
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        # CreateMutexW 返回句柄；GetLastError 为 ERROR_ALREADY_EXISTS(183)
+        # 说明已有另一个实例持有它。
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel32.CreateMutexW(None, False, APP_MUTEX_NAME)
+        already = ctypes.get_last_error() == 183
+        if already:
+            return False
+        _app_mutex_handle = handle      # 必须持有句柄，进程存活期间锁才有效
+        return True
+    except Exception:
+        return True
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 三个库并列在程序目录：assets.db（资源）、kg.db（图谱）、config.db（配置）；
-# data/config.yaml 仅作配置种子与导入导出格式，不参与日常读写。
+# data/config.json 仅作配置的构建种子，程序日常不读它，导入导出也一律用 JSON。
 config_store = ConfigStore(BASE_DIR)
 config = config_store.load()
 
@@ -97,7 +129,7 @@ class Pilot(QMainWindow):
         self.wt = 300
         self.ht = 300
         available = self.store.list_roles()
-        # 安装包不携带 data/config.yaml，配置由内置默认值播种（只登记了一个角色）。
+        # 安装包不携带 data/config.json，配置由内置默认值播种（只登记了一个角色）。
         # 这里以资源库中实际存在的人物为准补齐登记，使人物菜单与设置面板完整可用。
         if config_store.ensure_roles(available):
             config['frame_scale'] = config_store.load()['frame_scale']
@@ -161,16 +193,25 @@ class Pilot(QMainWindow):
     # ---------- 管理面板 ----------
 
     def open_manager(self):
-        """打开（或聚焦）管理面板。"""
+        """打开（或聚焦）管理面板。
+
+        v3.8 起面板是独立的 QMainWindow（任务栏有独立图标），
+        点关闭按钮只会隐藏到托盘，实例仍在——因此这里复用同一个面板，
+        不再每次重建（重建会丢失已填的表单，图谱也要重新加载）。
+        """
         if self._panel is None:
             self._panel = ManagerPanel(self, config)
         self._panel.refresh()
         self._panel.show()
+        self._panel.setWindowState(
+            (self._panel.windowState() & ~Qt.WindowMinimized)
+            | Qt.WindowActive)
         self._panel.raise_()
         self._panel.activateWindow()
 
-    def on_manager_closed(self):
-        self._panel = None
+    # 注：v3.7 曾有的 on_manager_closed() 已删除。面板关闭改为「隐藏到托盘」，
+    # 实例始终由 self._panel 持有、供 open_manager() 复用，无需在关闭时置空——
+    # 置空会导致下次打开新建实例，旧实例及其已加载的图谱一起泄漏。
 
     def set_role_timing(self, role, interval, scale):
         """设置指定角色的帧间隔与缩放；若是当前角色则即时生效。"""
@@ -260,7 +301,8 @@ class Pilot(QMainWindow):
         self.pm, mask = self._frames[self.index]
         size = self.pm.size()
         if size.width() < self.minimumWidth() or size.height() < self.minimumHeight():
-            self.setMinimumSize(0, 0)   # 先解除上一帧遮罩留下的下限
+            # 先解除上一帧遮罩留下的下限（显式 int，避开类型推断为联合类型）
+            self.setMinimumSize(0, 0)
         self.resize(size)
         self.setMask(mask)
         self.setMinimumSize(0, 0)
@@ -314,7 +356,15 @@ class Pilot(QMainWindow):
         # 窗口属性必须在定位之前设好：setWindowFlags 会重置窗口几何，
         # 若在其之前 setGeometry，位置与尺寸会被 Qt 丢弃（这正是「切换后总被
         # 拽回左上角 / 尺寸不跟随」的直接原因）。
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)  # 窗口置顶且去掉边框
+        #
+        # v3.8：**加 Qt.Tool** —— 伙伴本体不再占用任务栏位置。
+        # 原先只有 FramelessWindowHint，Windows 仍会为它创建一个任务栏按钮，
+        # 于是桌面上多了个「什么都不干」的窗口（它不可最小化、点它也只是
+        # 闪一下伙伴）。Qt.Tool 在 Windows 上映射为 WS_EX_TOOLWINDOW，
+        # 不进任务栏也不进 Alt+Tab，只有托盘图标——这才是桌面挂件该有的样子。
+        # 需要管理功能时用托盘「管理面板」，那时任务栏才出现面板图标。
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint
+                            | Qt.FramelessWindowHint)  # 工具窗口：置顶、无边框、不占任务栏
         self.setAutoFillBackground(False)  # 设置窗口背景透明
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
@@ -520,6 +570,13 @@ class Pilot(QMainWindow):
     def quit(self):
         # 退出程序
         self.save_config()
+        # 面板是独立主窗口，不会随本窗口销毁——必须显式关闭，
+        # 否则它会留在任务栏里，而进程退出后变成一个点不开的空窗口
+        if self._panel is not None:
+            self._panel.setAttribute(Qt.WA_DeleteOnClose, True)
+            self._panel.close()
+            self._panel.deleteLater()
+            self._panel = None
         self.store.close()
         self.close()
         sys.exit()
@@ -537,14 +594,28 @@ class Pilot(QMainWindow):
             self.quit()
         elif action == hide:
             # 通过设置透明度方式隐藏伙伴
-            self.setWindowOpacity(0)
+            self.set_visible(False)
         elif action == talking and self.audio_player and not mixer.get_busy() and self.talk_list:
             self._play_voice(self.role_name, random.choice(self.talk_list))
         elif action == konwing and self.audio_player and not mixer.get_busy() and self.know_list:
             self._play_voice(self.role_name, random.choice(self.know_list))
 
+    def set_visible(self, visible):
+        """显示 / 隐藏桌面上的伙伴（透明隐藏）。
+
+        **唯一的显隐入口**：托盘右键的「隐藏」、托盘的「显示」、
+        以及管理面板「窗口」菜单里的勾选项都走这里。
+        收口的原因：管理面板那个勾选项要反映伙伴的真实状态，
+        若各处直接调``setWindowOpacity``，从托盘隐藏伙伴后面板就会显示过期状态。
+        """
+        self.setWindowOpacity(1.0 if visible else 0.0)
+        panel = self._panel
+        # 面板可能尚未创建/已销毁，两种情况都属正常，直接跳过同步
+        if panel is not None:
+            panel._sync_window_state()
+
     def showwin(self):
-        self.setWindowOpacity(1)
+        self.set_visible(True)
 
     def set_audio(self, area):
         """
@@ -598,7 +669,16 @@ class Pilot(QMainWindow):
 
 
 if __name__ == '__main__':
+    # 已有实例在运行时不重复启动：挂件会多出一个、两个实例还会同时写
+    # config.db / assets.db / kg.db，容易互相覆盖对方的设置。
+    if not create_app_mutex():
+        sys.exit(0)
     # 创建程序和对象
     app = QApplication(sys.argv)
+    # 明确用 ApplicationName：任务栏与 Alt+Tab 显示的是这个名字，
+    # 而不是可执行文件名（PyInstaller 的 exe 名带中文时尤其明显）
+    app.setApplicationName('原神桌面伙伴')
+    app.setApplicationDisplayName('原神桌面伙伴')
+    app.setOrganizationName('Pilot-KG')
     pilot = Pilot()
     sys.exit(app.exec())

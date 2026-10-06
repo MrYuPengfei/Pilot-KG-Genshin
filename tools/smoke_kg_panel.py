@@ -56,7 +56,10 @@ class FakeStore:
 
 
 class FakePilot(QWidget):
-    """QWidget 兼作 pilot：面板构造时会把 pilot 当作 QDialog 的 parent 传入。"""
+    """QWidget 兼作 pilot：面板会读取它的 store / config_store / _frames 等成员。
+
+    v3.8 起面板是独立 QMainWindow，不再把 pilot 作为 Qt 父窗口传入。
+    """
 
     def __init__(self, base_dir):
         super().__init__()
@@ -67,9 +70,6 @@ class FakePilot(QWidget):
         self._frames = []
         self.index = 0
         self.audio_player = True
-
-    def on_manager_closed(self):
-        pass
 
     def set_voice_enabled(self, v):
         self.audio_player = v
@@ -94,6 +94,12 @@ class FakePilot(QWidget):
 
     def _rebuild_role_menu(self):
         pass
+
+    def set_visible(self, visible):
+        self.setWindowOpacity(1.0 if visible else 0.0)
+
+    def quit(self):
+        """面板菜单「退出程序」会调用；桩件里什么都不做。"""
 
     def _rebuild_bgm_menu(self):
         pass

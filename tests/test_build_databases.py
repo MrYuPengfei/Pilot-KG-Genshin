@@ -1,7 +1,8 @@
-"""tools/build_databases.py 测试：由 CSV/YAML 构建 kg.db 与 config.db。
+"""tools/build_databases.py 测试：由 CSV/JSON 构建 kg.db 与 config.db。
 
-这是 v3.5 的核心链路——安装包里的库由构建工具从 CSV/YAML 生成，
-运行时不再读 CSV/YAML。测试全部在临时目录中进行，不碰真实的三个库。
+这是 v3.5 的核心链路——安装包里的库由构建工具从 CSV/JSON 生成，
+运行时不再读 CSV/JSON（v3.8 起配置种子为 JSON，YAML 已退役）。
+测试全部在临时目录中进行，不碰真实的三个库。
 """
 
 import importlib.util
@@ -9,8 +10,9 @@ import os
 import sqlite3
 import sys
 
+import json
+
 import pytest
-import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -28,7 +30,7 @@ _spec.loader.exec_module(build_databases)
 
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
-    """把构建工具的路径常量指向临时目录，并造一份最小的 CSV/YAML 输入。"""
+    """把构建工具的路径常量指向临时目录，并造一份最小的 CSV/JSON 输入。"""
     csv_dir = tmp_path / 'data' / 'csv'
     csv_dir.mkdir(parents=True)
     # 实体表：人物 + 神之眼（label 决定类型）
@@ -40,16 +42,16 @@ def workspace(tmp_path, monkeypatch):
     (csv_dir / 'rel-character-element.csv').write_text(
         'node1,rel,node2\n甲,element_is,岩\n乙,element_is,火\n', encoding='utf-8')
 
-    seed = tmp_path / 'data' / 'config.yaml'
-    seed.write_text(yaml.dump({
+    seed = tmp_path / 'data' / 'config.json'
+    seed.write_text(json.dumps({
         'audio': False, 'bg_music': False, 'role': '乙',
         'img_path': 'png', 'music_path': 'music',
         'frame_scale': {'甲': [70, 1.4], '乙': [60, 0.8]},
-    }, allow_unicode=True), encoding='utf-8')
+    }, ensure_ascii=False), encoding='utf-8')
 
     monkeypatch.setattr(build_databases, 'ROOT', str(tmp_path))
     monkeypatch.setattr(build_databases, 'CSV_DIR', str(csv_dir))
-    monkeypatch.setattr(build_databases, 'SEED_YAML', str(seed))
+    monkeypatch.setattr(build_databases, 'SEED_JSON', str(seed))
     monkeypatch.setattr(build_databases, 'KG_DB', str(tmp_path / 'kg.db'))
     monkeypatch.setattr(build_databases, 'CONFIG_DB', str(tmp_path / 'config.db'))
     return tmp_path
@@ -120,14 +122,14 @@ def test_build_kg_leaves_no_partial_db(workspace, monkeypatch):
 
 # ---------- config.db ----------
 
-def test_build_config_from_yaml(workspace):
+def test_build_config_from_json_seed(workspace):
     report = build_databases.build_config(verbose=False)
     assert report['roles'] == 2 and report['role'] == '乙'
     store = ConfigStore(str(workspace), auto_seed=False)
     cfg = store.load()
     assert cfg['role'] == '乙'
     assert cfg['frame_scale']['甲'] == [70, 1.4]      # 精确保留出厂值
-    assert store.get_meta('seeded_from') == 'data/config.yaml'
+    assert store.get_meta('seeded_from') == 'data/config.json'
     store.close()
 
 
@@ -143,8 +145,8 @@ def test_build_config_force(workspace):
 
 
 def test_build_config_missing_seed_still_builds(workspace, monkeypatch):
-    """没有 YAML 也能构建：出厂配置退化为内置默认值。"""
-    monkeypatch.setattr(build_databases, 'SEED_YAML', str(workspace / 'nope.yaml'))
+    """没有种子也能构建：出厂配置退化为内置默认值。"""
+    monkeypatch.setattr(build_databases, 'SEED_JSON', str(workspace / 'nope.json'))
     report = build_databases.build_config(verbose=False)
     assert report['role'] == DEFAULTS['role']
     store = ConfigStore(str(workspace), auto_seed=False)
@@ -196,3 +198,61 @@ def test_runtime_does_not_need_csv(workspace):
     cfg = ConfigStore(str(workspace), auto_seed=False)
     assert cfg.load()['role'] == '乙'
     cfg.close()
+
+
+# ============ v3.7：--force 重建前自动备份（防丢用户编辑）============
+
+def test_force_build_backs_up_existing_db(workspace, monkeypatch):
+    """回归（v3.7）：--force 重建前必须备份，否则用户在程序里对图谱的编辑
+    会被 data/csv 静默覆盖，导致新安装包仍是旧数据。"""
+    # 先造一个"用户编辑过"的库
+    store = KGStore(str(workspace / 'kg.db'), auto_seed=False)
+    store.import_csv(build_databases.CSV_DIR, replace=True)
+    store.add_node('npc', '我新增的实体', {'mine': 'yes'})
+    store.close()
+
+    res = build_databases.build_kg(force=True, check_only=False, verbose=False)
+    backup = res.get('backup')
+    assert backup, '重建前应生成备份文件'
+
+    # 备份里应含用户编辑过的内容
+    bak = KGStore(backup, auto_seed=False)
+    assert ('npc', '我新增的实体') in bak.nodes, '备份里丢了用户新增的实体'
+    bak.close()
+
+    # 重建后的库来自 CSV，不含该实体
+    new = KGStore(str(workspace / 'kg.db'), auto_seed=False)
+    assert ('npc', '我新增的实体') not in new.nodes
+    new.close()
+
+
+def test_backup_can_be_nothing_when_db_absent(workspace, monkeypatch):
+    """库不存在时无需备份（不报错）。"""
+    if os.path.isfile(workspace / 'kg.db'):
+        os.remove(workspace / 'kg.db')
+    res = build_databases.build_kg(force=True, check_only=False, verbose=False)
+    assert res.get('backup') is None
+
+
+def test_build_config_backs_up_existing(workspace, monkeypatch):
+    """config.db 同理：--force 会丢弃用户调好的帧率/缩放，须先备份。
+
+    备份的就是 CONFIG_DB 本身（只读校验即可，不必再打开）。
+    """
+    cs = ConfigStore(str(workspace), auto_seed=False)
+    cs.set_frame_scale('测试人物', 123, 2.5)
+    cs.close()
+
+    res = build_databases.build_config(force=True, check_only=False, verbose=False)
+    backup = res.get('backup')
+    assert backup, '重建前应生成备份文件'
+    assert os.path.isfile(backup), '备份文件应真实存在'
+    # 备份在重建后仍保留（不会被清理掉）
+    assert os.path.isfile(backup)
+
+
+def test_no_backup_option_skips_backup(workspace, monkeypatch):
+    """--no-backup 生效时不产生备份文件。"""
+    build_databases.build_kg(force=True, check_only=False, verbose=False, backup=False)
+    res = build_databases.build_kg(force=True, check_only=False, verbose=False, backup=False)
+    assert res.get('backup') is None

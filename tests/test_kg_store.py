@@ -49,6 +49,123 @@ def test_db_persists_across_instances(tmp_path):
     assert second.find('持久化测试') == [('npc', '持久化测试')]
 
 
+# ---------- 每次改动都落盘（v3.8 锁定） ----------
+#
+# 需求：「每次修改（增删改）后，将改动保存到 kg.db」。
+# 实现上每个写方法都用 `with self._conn:` 包裹（块退出即 commit），
+# 下面这些用例**关掉连接重开一个新实例**来验证，避免「内存里有、文件里没有」
+# 的假象——只查内存索引是测不出漏提交的。
+
+def test_add_node_persists_immediately(tmp_path):
+    """新增实体：不close 直接重开也应能看到。"""
+    db = str(tmp_path / 'kg.db')
+    KGStore(db, seed_dir=DATA_DIR).add_node('npc', '即时落盘A')
+    assert ('npc', '即时落盘A') in KGStore(db, auto_seed=False).nodes
+
+
+def test_update_node_persists_immediately(tmp_path):
+    """改属性/改名：改名会连带迁移关系，重开后都要对得上。"""
+    db = str(tmp_path / 'kg.db')
+    store = KGStore(db, seed_dir=DATA_DIR)
+    store.add_node('npc', '即时落盘B')
+    store.update_node(('npc', '即时落盘B'), name='即时落盘B2',
+                      attrs={'来源': '单测', '等级': '90'})
+    store.close()
+
+    reopened = KGStore(db, auto_seed=False)
+    assert ('npc', '即时落盘B2') in reopened.nodes
+    assert reopened.node_attrs(('npc', '即时落盘B2')) == {'来源': '单测', '等级': '90'}
+
+
+def test_delete_node_persists_immediately(tmp_path):
+    """删除实体：重开后不应复活（连同其关系一起消失）。"""
+    db = str(tmp_path / 'kg.db')
+    store = KGStore(db, seed_dir=DATA_DIR)
+    store.add_node('npc', '即时落盘C')
+    store.add_edge(('npc', '即时落盘C'), 'test_rel', ('character', '钟离'))
+    store.delete_node(('npc', '即时落盘C'))
+    store.close()
+
+    reopened = KGStore(db, auto_seed=False)
+    assert ('npc', '即时落盘C') not in reopened.nodes
+    assert not any('即时落盘C' in (e[0][1], e[2][1]) for e in reopened._edges)
+
+
+def test_add_edge_persists_immediately(tmp_path):
+    """新增关系：重开后仍在，且两端类型/名字都对。"""
+    db = str(tmp_path / 'kg.db')
+    store = KGStore(db, seed_dir=DATA_DIR)
+    store.add_node('npc', '即时落盘D')
+    store.add_edge(('npc', '即时落盘D'), 'test_rel', ('character', '钟离'))
+    store.close()
+
+    reopened = KGStore(db, auto_seed=False)
+    # _edges 是 set，元素为 ((源类型,源名), 关系名, (目标类型,目标名))
+    assert (('npc', '即时落盘D'), 'test_rel', ('character', '钟离')) in reopened._edges
+
+
+def test_update_and_delete_edge_persist_immediately(tmp_path):
+    """改关系名 / 换对端 / 删关系，三种都要落盘。
+
+    这条走的是 ``*_edge_touching`` 包装（面板的可视化用的是它），
+    它本身不碰数据库、只委托给 ``update_edge`` / ``delete_edge``——
+    一旦委托链断了，改动就只留在内存里，故单独锁一次。
+    """
+    db = str(tmp_path / 'kg.db')
+    store = KGStore(db, seed_dir=DATA_DIR)
+    store.add_node('npc', '即时落盘E')
+    store.add_edge(('npc', '即时落盘E'), '旧关系', ('character', '钟离'))
+
+    src, dst = ('npc', '即时落盘E'), ('character', '钟离')
+    store.update_edge_touching(src, '旧关系', dst, new_rel='新关系')
+    store.close()
+    reopened = KGStore(db, auto_seed=False)
+    assert (src, '新关系', dst) in reopened._edges
+    assert (src, '旧关系', dst) not in reopened._edges
+    reopened.close()
+
+    store = KGStore(db, auto_seed=False)
+    store.delete_edge_touching(src, '新关系', dst)
+    store.close()
+    reopened = KGStore(db, auto_seed=False)
+    assert (src, '新关系', dst) not in reopened._edges
+    assert src in reopened.nodes      # 只删关系，实体仍在
+
+
+def test_import_csv_persists_immediately(tmp_path):
+    """整目录导入 CSV 同样要落盘（面板的「导入图谱 CSV」走这条）。"""
+    db = str(tmp_path / 'kg.db')
+    store = KGStore(db, auto_seed=False)
+    csv_dir = tmp_path / 'csv'
+    csv_dir.mkdir()
+    (csv_dir / 'label-character.csv').write_text(
+        'name,label,element\n甲,character,岩\n乙,character,火\n', encoding='utf-8')
+    (csv_dir / 'rel-character-element.csv').write_text(
+        'node1,rel,node2\n甲,element_is,岩\n乙,element_is,火\n', encoding='utf-8')
+    store.import_csv(str(csv_dir), replace=True)
+    store.close()
+
+    reopened = KGStore(db, auto_seed=False)
+    # 关系表里的「岩」「火」会被自动建为 element 实体，故是 2 人物 + 2 元素
+    assert reopened.stats()['nodes'] == 4
+    assert reopened.stats()['edges'] == 2
+
+
+def test_kg_db_is_not_overwritten_on_upgrade():
+    """**升级安装不得覆盖用户的 kg.db**。
+
+    图谱编辑就写在安装目录的 kg.db 里。若安装脚本跟着 recursesubdirs
+    无条件复制，每次升级都会把用户的编辑清空——表现为「明明存了，
+    升级后就没了」。config.db 同理，两者都必须 onlyifdoesntexist。
+    """
+    iss = open(os.path.join(ROOT, 'setup.iss'), encoding='utf-8').read()
+    assert 'Excludes: "config.db,kg.db"' in iss, \
+        '批量复制必须排除 config.db 与 kg.db'
+    for db in ('config.db', 'kg.db'):
+        assert f'_internal\\{db}"; DestDir: "{{app}}\\_internal"; Flags: onlyifdoesntexist' in iss, \
+            f'{db} 应用 onlyifdoesntexist 安装，否则升级会清空用户数据'
+
+
 def test_find_and_neighbors(kg):
     keys = kg.find('阿贝多')
     assert keys == [('character', '阿贝多')]

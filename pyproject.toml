@@ -1,10 +1,9 @@
 [project]
 name = "pilot"
-version = "3.7.0"
+version = "3.8.0"
 requires-python = ">=3.14"
 dependencies = [
 	"PySide6>=6.8",
-	"PyYAML>=6.0",
 	"pygame-ce>=2.5",
 ]
 

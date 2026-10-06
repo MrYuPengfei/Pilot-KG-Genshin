@@ -2,6 +2,8 @@ gif
 music
 png
 .DS_Store
+.build
+.workbuddy
 *.iml
 *.xml
 *.xmind
@@ -25,6 +27,9 @@ assets.db
 kg.db
 # 配置库（出厂值随包分发，升级时 onlyifdoesntexist 保护用户改动）
 config.db
+# --force 重建前的自动备份（build_databases.py 生成，文件名带时间戳）
+*.db.bak-*
+*.db.building
 
 # 打包产物
 build/

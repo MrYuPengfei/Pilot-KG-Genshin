@@ -1,12 +1,12 @@
 """打包「数据包」：把 data/ 打成独立压缩包，供非 git 渠道发布。
 
 背景：安装包自 v3.4.1 起只带「程序 + assets.db + kg.db + 图标」，**不带 data 文件夹**——
-知识图谱 CSV（data/csv，27 个）与配置种子（data/config.yaml）体积小但更新频率低，
+知识图谱 CSV（data/csv，27 个）与配置种子（data/config.json）体积小但更新频率低，
 改为随源码分发、或用本脚本打成数据包单独发布。
 
 生成两个文件（默认输出到 dist_data/）：
 
-- ``pilot_data_<版本>.zip``    —— 完整数据包，解压到程序目录即生效（含 config.yaml）
+- ``pilot_data_<版本>.zip``    —— 完整数据包，解压到程序目录即生效（含 config.json）
 - ``pilot_kg_csv_<版本>.zip``  —— 仅知识图谱 CSV，供已安装用户单独补图谱数据
 
 用法::
@@ -64,7 +64,7 @@ def build(out_dir, only=None):
     version = _version()
     os.makedirs(out_dir, exist_ok=True)
     csv_dir = os.path.join(ROOT, 'data', 'csv')
-    seed = os.path.join(ROOT, 'data', 'config.yaml')
+    seed = os.path.join(ROOT, 'data', 'config.json')
 
     if not os.path.isdir(csv_dir):
         print(f'警告：{csv_dir} 不存在，知识图谱数据包将为空包。', file=sys.stderr)
@@ -77,7 +77,7 @@ def build(out_dir, only=None):
     if only in (None, 'all', 'data'):
         entries = list(csv_files)
         if os.path.isfile(seed):
-            entries.append((seed, 'data/config.yaml'))
+            entries.append((seed, 'data/config.json'))
         else:
             print(f'警告：{seed} 不存在，数据包将不含配置种子。', file=sys.stderr)
         target = os.path.join(out_dir, f'pilot_data_{version}.zip')

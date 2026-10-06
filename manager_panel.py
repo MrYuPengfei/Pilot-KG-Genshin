@@ -1,19 +1,35 @@
-"""管理面板：人物管理 / 音乐管理 / 素材管理 / 知识图谱 / 帮助文档五个标签页。
+"""管理面板：人物管理 / 音乐管理 / 素材管理 / 知识图谱 / 窗口与状态 / 帮助文档六个标签页。
 
 从托盘菜单「管理面板」打开。面板通过 Pilot 暴露的方法操作，
 所有变更即时生效并与托盘菜单状态保持同步。
+
+**v3.8：面板由 QDialog 改为 QMainWindow**，并新增「窗口与状态」标签页：
+
+1. **任务栏有独立图标**。原先作为 ``Pilot`` 的子弹窗运行时，Windows 会把它
+   并进伙伴那个「无边框置顶」窗口的任务栏分组里，用户在任务栏上找不到它。
+   改成主窗口并显式声明 ``Qt.Window`` 后，任务栏出现独立条目，
+   可以像普通程序那样最小化、最大化、还原。
+2. **窗口命令有落脚处**。原先面板没有任何窗口状态入口。
+   现放在「窗口与状态」页：最小化、最大化 / 还原、全屏 / 退出全屏、
+   隐藏面板、显示桌面上的伙伴，同页还有当前窗口状态与版本等信息。
+3. **关闭 = 隐藏**。点关闭按钮或 Alt+F4 只是隐藏到托盘，伙伴继续运行；
+   再从托盘「管理面板」唤出即可，不必重建面板（重建会丢失已填的表单状态）。
+
+**不用菜单栏**：面板的全部功能都挂在标签页上，窗口命令也有专门的标签页，
+再加一层菜单只会让「换页」与「做事」分散在两处。
 """
 
 import html
 import os
 
-from PySide6.QtCore import Qt, QStringListModel
-from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtWidgets import (QDialog, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
+from PySide6.QtCore import Qt, QStringListModel, QEvent
+from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QListWidget, QLabel, QPushButton, QSpinBox, QDoubleSpinBox,
                                QCheckBox, QMessageBox, QFileDialog, QGroupBox, QFormLayout,
                                QTextBrowser, QLineEdit, QCompleter, QSplitter,
-                               QComboBox, QProgressDialog, QApplication)
+                               QComboBox, QProgressDialog, QApplication, QDialog,
+                               QTabWidget)
 
 from asset_exporter import export_assets, _human_size
 from kg_store import (NODE_TYPES, get_default_store, reset_default_store,
@@ -21,307 +37,313 @@ from kg_store import (NODE_TYPES, get_default_store, reset_default_store,
 from kg_editor import NodeEditDialog, EdgeEditDialog
 from kg_view import KGCanvas
 
-APP_VERSION = '3.7'
+APP_VERSION = '3.8'
 REPO_URL = 'https://github.com/MrYuPengfei/Pilot-KG-Genshin.git'
+
+# 全局按钮尺寸：管理面板**所有页**的按钮一律用这个尺寸，保证视觉一致。
+# 必须显式 setFixedSize——同一行的 QPushButton 默认 sizePolicy 会被拉伸成等宽，
+# 文字长短仍会让观感不一致（v3.7 逐页统一时踩过）。
+BTN_W: int = 132
+BTN_H: int = 32
 REPO_PAGE = 'https://github.com/MrYuPengfei/'
 
-HELP_HTML = f"""
-<h2>原神桌面伙伴 v{APP_VERSION} · 帮助文档</h2>
-<p><a href="{REPO_PAGE}">开源地址：{REPO_URL}</a></p>
-<hr>
-
-<h3>一、导入素材注意事项</h3>
-<p>通过「素材管理」标签页导入 <b>zip 文件或目录</b>，
-素材包内部必须沿用如下布局（png/ 与 music/ 可只提供其一）：</p>
-<pre>
-素材包/
-  png/&lt;人物&gt;/*.png                人物帧（逐帧 PNG）
-  music/&lt;人物&gt;/*.mp3              人物语音
-  music/&lt;地区&gt;/background.mp3     地区背景音乐
-</pre>
-<ul>
-<li><b>帧图片</b>：建议统一尺寸、按播放顺序命名（如 0001.png、0002.png…），程序按文件名排序播放；
-单帧人物也可正常显示（静态图）。</li>
-<li><b>语音命名决定自动分类</b>：「早上好 / 中午好 / 晚上好 / 晚安」归入问候（按时段自动播放），
-「闲聊*」归入闲聊，「想要了解*」归入了解；其余命名不分类，仅占用语音列表。</li>
-<li><b>地区识别规则</b>：music/ 下只要目录内含 background.mp3 即被识别为地区，
-因此请勿把 background.mp3 放进人物语音目录。</li>
-<li><b>同名覆盖</b>：重复导入时同名资源会被覆盖更新，不会产生重复记录。</li>
-<li><b>新人物默认值</b>：首次导入的人物按 帧间隔 60ms、缩放 1.0 登记，
-可在「人物管理」标签页中调整并保存。</li>
-<li><b>导入即生效</b>：导入成功后新人物/新地区立即出现在托盘菜单和人物列表中，无需重启。</li>
-<li><b>删除素材</b>：「素材管理」标签页可删除已导入的人物或地区；
-删除只影响资源库中的记录，不会删除原始素材文件。</li>
-<li><b>导出素材</b>：「素材管理」标签页可把资源库中的素材<b>按上面这套布局还原</b>成
-目录或 zip——导出的包可以直接再导入，因此可用于备份、离线编辑后回导、分享给他人。
-资源库约 460MB，全量导出需要几十秒，期间界面会短暂无响应。</li>
-<li><b>版权提醒</b>：本项目仅供学习交流，请勿导入或分发侵犯第三方版权的素材。</li>
-</ul>
-<hr>
-
-<h3>二、版本变更记录</h3>
-<h4>v{APP_VERSION}（当前版本）</h4>
-<ul>
-<li><b>切换人物时会按时段问好</b>：<b>托盘菜单</b>或管理面板切换角色后，新人物会按
-<b>当前时段</b>向你问好——早上说「早上好」、中午说「中午好」、下午与晚上说「晚上好」、
-深夜与凌晨说「晚安」。为避免连点同一个人时变成噪音，同一人在同一时段内一分钟只问一次；
-<b>换人</b>或<b>跨过时段</b>则立即问候，不受此限制。</li>
-<li><b>「素材管理」页的导入与导出拆为两个独立模块</b>：两者职责不同，分组展示更清晰
-（「导入素材」/「导出素材」/「配置文件」各为一组）；但所有按钮尺寸统一为
-<code>132×32</code>，视觉上整齐一致。导出范围（全部素材 / 仅当前人物）在导出模块内。</li>
-<li><b>修复编辑对话框的补全崩溃</b>：在「新增 / 编辑关系」里点击实体搜索框的
-补全候选时，曾抛出 <code>itemFromIndex(str)</code>——补全控件发出的信号带的是文本
-而非索引，代码却当索引用。现改为按候选文本定位，并让键盘上下移动时也同步类型。</li>
-<li><b>消除画布的鼠标抓取警告</b>：节点不再调用基类的鼠标处理（那会抓取鼠标），
-双击重建场景后不会再出现 <code>ungrabMouse: not a mouse grabber</code>。</li>
-<li><b>修复知识图谱双击崩溃</b>：双击节点时画布会以它为中心重绘，而重绘会销毁
-「正在处理这次双击的节点对象」本身，导致抛出
-<code>Internal C++ object (NodeItem) already deleted</code>。现已调整事件处理顺序，
-并为已销毁的节点加存活标记，滞后到达的点击会被安全忽略。</li>
-<li><b>消除启动时的托盘警告</b>：原先托盘在设置图标之前就被显示，Qt 会打印
-<code>QSystemTrayIcon::setVisible: No Icon set</code>；现已改为先设图标再显示托盘。</li>
-<li><b>代码质量整改</b>（不改变任何功能）：清理 15 处无效的正则转义警告与
-无用导入、修正一处会触发 <code>NameError</code> 的 f-string 笔误、
-消除重复定义的方法；核心模块与全部测试现已通过静态检查零告警。</li>
-</ul>
-<h4>v3.6</h4>
-<ul>
-<li><b>新增素材导出</b>（管理面板「素材管理」页）：可把资源库中的帧、语音、地区背景音乐
-还原为 <code>png/</code> 与 <code>music/</code> 目录树，或打包成单个 zip；
-可选择「全部素材」或「仅当前人物」。导出结果<b>符合素材包格式</b>，可用「导入素材」直接并入，
-也便于备份、离线编辑后回导、分享给他人。</li>
-<li><b>修复人物切换异常</b>：切换人物后不再被拽回屏幕左上角（窗口定位参数错位），
-窗口尺寸能正确跟随人物的缩放设置（切换遮罩残留导致的尺寸下限未解除），
-大缩放角色也不会跑出屏幕；切换后立即保存当前人物，无需等到退出程序。</li>
-<li>动画帧循环修正：不再跳过首帧，仅 1~2 帧的自定义角色也能正常播放；
-反复切换人物不再累积已删除的界面控件。</li>
-<li><b>修复角色问好</b>：语音分类器改按<b>关键词</b>识别问候语——菲谢尔的
-「早上好问候菲谢尔.mp3」、迪奥娜的「中午好罐头.mp3」此前被归为无分类，早上问候找不到文件；
-时段表补全（原先 0~3 点与 15~17 点共 7 小时完全静默）；缺对应语音时自动降级到该角色
-已有的问候，不会因缺文件而中断（切换人物时的问候见 v3.7）。</li>
-<li><b>移除「恢复出厂设置」按钮</b>：它会连带清空每个人物调好的帧率与缩放，风险大于便利。
-确需恢复出厂值时，删除程序目录下的 <code>config.db</code> 后重新安装即可。</li>
-</ul>
-<h4>v3.5</h4>
-<ul>
-<li><b>数据一律由 SQLite 管理</b>：安装包只带 <code>assets.db</code>、<code>kg.db</code>、
-<code>config.db</code> 三个库与图标，<b>不含任何 CSV / YAML</b>；</li>
-<li>CSV 与 YAML 降级为<b>本地构建输入</b>：由 <code>tools/build_databases.py</code> 生成
-<code>kg.db</code> 与出厂 <code>config.db</code>，打包前执行一次即可；</li>
-<li><b>运行时不再读取 CSV / YAML</b>——知识图谱来自包内 <code>kg.db</code>，配置来自
-<code>config.db</code>。若 <code>config.db</code> 缺失，会用内置默认值并按
-<code>assets.db</code> 中已有的人物自动登记帧率与缩放，功能完整可用；</li>
-<li>两个库新增库结构版本（<code>schema_version</code>）与来源标记，知识图谱页状态栏
-会显示当前图谱的来源与版本；</li>
-<li><code>config.db</code> 以「仅当不存在时安装」方式随包分发，<b>升级不会覆盖你的设置</b>。</li>
-</ul>
-<h4>v3.4</h4>
-<ul>
-<li><b>目录重构</b>：<code>src/</code> → <code>ico/</code>（图标）；
-<code>GenshinKG/data/</code> → <code>data/csv/</code>（知识图谱初始数据）；
-<code>GenshinKG/utils/</code> 的脚本并入 <code>tools/</code>。
-原先承载素材与数据的 <code>GenshinKG/</code> 目录已全部并入上述位置，不再单独存在；</li>
-<li><b>配置改用 SQLite 管理</b>：新增 <code>config_store.py</code>，配置存放于
-<code>config.db</code>（表 <code>kv</code> / <code>frame_scale</code> / <code>config_meta</code>）。
-原 <code>config.yaml</code> 移至 <code>data/config.yaml</code> 并降级为<b>初始种子与导入导出格式</b>——
-首次运行播种一次，之后以库为准。配置不再被程序运行时改写，也不再是 git 冲突高发文件；</li>
-<li><b>新增配置文件导入导出</b>（管理面板「素材管理」页）：可导出 YAML / JSON 备份，
-或从 YAML / JSON 导入（<b>覆盖</b>会整体替换，<b>合并</b>只补充缺失的人物登记并保留现有设置）；</li>
-<li><b>健壮性</b>：配置种子缺失或损坏时自动退回内置默认值，不会因配置问题导致程序无法启动；
-导入他人配置时若当前人物在本地无资源，会自动回退到第一个可用人物；
-人物帧间隔与缩放在入库前夹紧到面板允许范围（20~1000ms、0.1~3.0）；</li>
-</ul>
-<h4>v3.3</h4>
-<ul>
-<li>知识图谱改为数据库存储：新增 <code>kg.db</code>（SQLite，表 kg_nodes / kg_edges / kg_meta），
-与素材库 <code>assets.db</code> 并列；首次运行自动从 <code>data/csv</code> 播种，
-此后以库为准，CSV 退化为导入/导出格式；</li>
-<li>知识图谱新增 CSV 导入与导出：可导入 CSV 目录（<code>label-*.csv</code> + <code>rel-*.csv</code>）
-或单个实体表/关系表，支持「合并」与「覆盖」两种模式；导出按原始布局生成
-<code>label-&lt;类型&gt;.csv</code> 与 <code>rel-&lt;源类型&gt;-&lt;目标类型&gt;.csv</code>，导出目录可整目录回灌；</li>
-<li>知识图谱新增节点与关系编辑：可新增、改名/改类型/改属性、删除实体（连带其关系），
-以及新增、改名、换对端、删除关系；关系列表区分方向（<code>→</code> 出边 / <code>←</code> 入边）；</li>
-<li>文档全面完善：README、部署说明、重构日志与本页同步至 v3.3，
-补齐目录结构、快捷键、知识图谱使用说明与致谢信息；</li>
-<li>项目仓库迁移至 <code>Pilot-KG-Genshin</code>，帮助页开源地址同步更新；</li>
-<li>安装器发布地址由旧 gitee 仓库改为 GitHub。</li>
-</ul>
-<h4>v3.2</h4>
-<ul>
-<li>文档全面完善：README、部署说明、重构日志与本页同步至 v3.2，
-补齐目录结构、快捷键、知识图谱使用说明与致谢信息；</li>
-<li>项目仓库迁移至 <code>Pilot-KG-Genshin</code>，帮助页开源地址同步更新；</li>
-<li>安装器发布地址由旧 gitee 仓库改为 GitHub。</li>
-</ul>
-<h4>v3.1</h4>
-<ul>
-<li>全局更名：「桌面宠物」统一改为「桌面伙伴」，主程序类 <code>Pet</code> 更名为 <code>Pilot</code>，
-应用名、安装目录与安装包名称同步更名；</li>
-<li>入口脚本由 <code>desktoppet.py</code> 更名为 <code>pilot.py</code>，包名同步；</li>
-<li>托盘菜单精简：移除「导入素材包」入口（素材导入统一由管理面板「素材管理」承担）。</li>
-</ul>
-<h4>v3.0</h4>
-<ul>
-<li>知识图谱可视化首次上线（管理面板「知识图谱」页，基于 data/csv 数据：
-12 类实体、1900+ 节点、7500+ 关系，支持实体搜索、自我中心网展示、
-单击查看属性与关系、双击节点继续展开）。</li>
-</ul>
-<h4>v2.1</h4>
-<ul>
-<li>新增管理面板：人物预览与管理、帧率/缩放调整、音乐控制、资源统计、素材导入；</li>
-<li>管理面板内置帮助文档页；</li>
-<li>配置变更即时保存，不再依赖退出时写盘。</li>
-</ul>
-<h4>v2.0</h4>
-<ul>
-<li>资源收进单个 SQLite 数据库 assets.db（替代近万个零散文件，附带文件系统回退）；</li>
-<li>动画帧预加载缓存：消除每帧磁盘读取与重复解码缩放，动画更流畅；</li>
-<li>新增第三方素材导入模块（目录/zip），人物与地区菜单改为动态生成；</li>
-<li>修复单帧人物索引越界等多项问题；</li>
-<li>全新安装包：每用户目录安装（免管理员）、支持覆盖安装与正常卸载。</li>
-</ul>
-<h4>v1.1</h4>
-<ul>
-<li>基础桌面伙伴：人物切换、拖动、隐藏、时段问候、闲聊/了解语音、地区背景音乐。</li>
-</ul>
-<hr>
-
-<h3>三、管理面板使用说明</h3>
-<p>本面板共五个标签页，所有改动<b>即时生效并自动保存</b>（写入 config.db / assets.db / kg.db，
-无需重启程序）。</p>
-<table border="1" cellspacing="0" cellpadding="4">
-<tr><th>标签页</th><th>能做什么</th></tr>
-<tr><td>人物管理</td>
-<td>左侧列出全部人物（含导入的），选中后显示首帧预览与帧数/语音数；
-可按人物调整帧间隔（20~1000ms）与缩放比例（0.1~3.0）、「设为当前伙伴」、「删除此人物」；
-列表中的「当前」标记即为正在显示的伙伴。</td></tr>
-<tr><td>音乐管理</td>
-<td>选择地区播放/停止背景音乐、开关人物语音、一键静音；
-与托盘「音乐」菜单的「～」选中状态双向同步。</td></tr>
-<tr><td>素材管理</td>
-<td>查看资源统计（存储后端、人物/地区/帧/语音数量、数据库大小）；
-导入 zip 或目录素材包；删除已导入的人物或地区；
-<b>导出素材</b>（全部或仅当前人物；目录或 zip，结果可再导入）；
-导出/导入配置文件（YAML / JSON）。</td></tr>
-<tr><td>知识图谱</td>
-<td>搜索实体（人物、武器、材料、副本、料理…）后展示以该实体为中心的自我中心网；
-<b>单击</b>节点看属性与关系清单，<b>双击</b>节点以它为中心重新展开，滚轮缩放、拖拽平移。
-右侧可新增/编辑/删除<b>实体</b>与<b>关系</b>，顶部可导入/导出 CSV、重新载入。
-首次打开该页时才加载图谱数据。</td></tr>
-<tr><td>帮助文档</td><td>本页：导入注意事项、版本记录、开源库许可与项目地址。</td></tr>
-</table>
-<p><b>快捷键</b>：Windows 下 Ctrl + ↑ / ↓ 缩放人物，Ctrl + Q 退出；
-桌面右键可隐藏伙伴，托盘菜单可随时唤回。</p>
-
-<h4>配置文件：存储、导入与导出</h4>
-<p>配置存放于程序目录的 <b>config.db</b>（SQLite），包含三张表：<code>kv</code>（当前人物、
-语音开关、背景音乐、素材路径等标量项）、<code>frame_scale</code>（每个人物的帧间隔与缩放）、
-<code>config_meta</code>（记录播种来源等元信息）。</p>
-<p>本文件随安装包分发一份<b>出厂值</b>，你在此处的任何修改都会写回同一个文件。
-为避免升级时覆盖你的设置，<b>覆盖安装只会在该文件不存在时才写入</b>——
-想恢复出厂值，删掉 <code>config.db</code> 后重新安装即可。</p>
-<p>出厂值由 <code>data/config.yaml</code> 在打包阶段生成（<code>tools/build_databases.py</code>），
-运行时程序<b>不再读取任何 YAML</b>；YAML 仅作为构建输入与手动导入的交换格式
-（也是后续服务器下发的载荷格式）。若 <code>config.db</code> 缺失，程序会用内置默认值
-并按 <code>assets.db</code> 中已有的人物自动登记帧率与缩放，<b>功能完整可用</b>。</p>
-<ul>
-<li><b>导出 YAML / JSON</b>：把当前配置存到指定文件。YAML 与旧版 config.yaml 同格式，
-可手工编辑后回导；JSON 便于程序化处理。</li>
-<li><b>导入配置</b>：选择 YAML 或 JSON 文件后，会让你选择模式——
-<b>覆盖</b>整体替换当前设置（当前人物、语音开关、背景音乐都会随之切换），
-<b>合并</b>则只补充缺失的人物登记、保留现有设置。导入报告会列出无法识别的键（会被忽略）。</li>
-<li><b>恢复出厂值</b>：面板不再提供一键重置（避免误清空调好的缩放与帧率）。
-如确需恢复出厂值，<b>删除程序目录下的 <code>config.db</code> 后重新安装</b>即可——
-安装程序只在文件不存在时才写入出厂配置，因此不会覆盖你已有的设置。</li>
-<li><b>容错说明</b>：库文件缺失或配置内容损坏时会自动使用内置默认值，程序不会因此无法启动；
-导入的配置若把当前人物指向了本地没有资源的人物，启动时会自动回退到第一个可用人物。</li>
-<li><b>迁移机器</b>：配置、资源、图谱分属三个库文件——<code>config.db</code>、<code>assets.db</code>、<code>kg.db</code>，
-均位于程序目录。换机器时把这三个文件（或导出的配置文件）一并带过去即可。</li>
-</ul>
-
-<h4>知识图谱：数据存储与编辑</h4>
-<p>图谱数据存放于程序目录下的 <b>kg.db</b>（SQLite），随安装包分发，<b>运行时不读取 CSV</b>。
-它包含三张表：<code>kg_nodes</code>（实体，属性以 JSON 保存）、<code>kg_edges</code>（有向关系）、
-<code>kg_meta</code>（库结构版本与来源等元信息）。状态栏会显示当前图谱的来源与版本。
-若 <code>kg.db</code> 缺失，可重新安装，或用下方「导入 CSV」从 CSV 导入。</p>
-<ul>
-<li><b>编辑实体</b>：选中实体后可改名、改类型、增删属性行。改名或改类型时，
-其全部关系的两端会自动跟着迁移，不会出现断链。</li>
-<li><b>删除实体</b>：会连带删除该实体的所有关系，操作前有确认弹窗提示关系条数。</li>
-<li><b>编辑关系</b>：在关系列表中选中一条（<code>→</code> 表示出边、<code>←</code> 表示入边），
-可改关系名或更换对端实体；两端可直接输入新名字，输入不存在的名字会自动按所选类型建为新实体。</li>
-<li><b>关系名</b>：填写 <code>element_is</code>、<code>part_of</code> 等已有键会显示对应中文
-（神之眼、属于…）；也可以自填中文或英文，此时直接按原文显示。</li>
-<li><b>导入 CSV</b>：可选择 CSV 目录（推荐，<code>label-*.csv</code> +
-<code>rel-*.csv</code>）或单个 CSV 文件。单个文件按表头自动识别：
-含 <code>node1,rel,node2</code> 视为关系表，含 <code>name</code> 且含
-<code>label</code>/<code>type</code> 视为实体表。导入时可选
-<b>合并</b>（同名实体覆盖属性）或<b>覆盖</b>（先清空现有图谱），导入完成后会报告新增/跳过数量。</li>
-<li><b>导出 CSV</b>：把当前图谱导出为目录，实体表命名为 <code>label-&lt;类型&gt;.csv</code>，
-关系表按真实方向命名为 <code>rel-&lt;源类型&gt;-&lt;目标类型&gt;.csv</code>；
-该目录可被「导入 CSV」整目录回灌，便于备份、分享与用表格软件编辑。</li>
-<li><b>重新载入</b>：丢弃内存中的状态，从 kg.db 重新读入。</li>
-<li><b>提示</b>：直接删除或替换 <code>kg.db</code> 后重启程序，会重新从初始 CSV 播种，
-即恢复为出厂图谱；若要保留自己的编辑，请先用「导出 CSV」备份。</li>
-</ul>
-<hr>
-
-<h3>四、第三方开源库</h3>
-<table border="1" cellspacing="0" cellpadding="4">
-<tr><th>库</th><th>用途</th><th>许可证</th></tr>
-<tr><td>PySide6 (Qt for Python)</td><td>窗口、托盘、管理面板等全部 GUI</td><td>LGPLv3</td></tr>
-<tr><td>pygame-ce</td><td>语音与背景音乐播放</td><td>LGPLv2.1</td></tr>
-<tr><td>PyYAML</td><td>配置文件读写</td><td>MIT</td></tr>
-<tr><td>SQLite（Python 内置 sqlite3）</td><td>资源数据库 assets.db</td><td>Public Domain</td></tr>
-<tr><td>pytest（开发依赖）</td><td>自动化测试</td><td>MIT</td></tr>
-<tr><td>PyInstaller（打包工具）</td><td>生成 Windows 可执行程序</td><td>GPL（打包产物不受限）</td></tr>
-<tr><td>Inno Setup（打包工具）</td><td>生成安装向导</td><td>Inno Setup License</td></tr>
-</table>
-<hr>
-
-<h3>五、音视频素材</h3>
-<p>本软件仅供开发研究玩乐，请勿用作商业用途。音视频素材版权归上海米哈游网络科技股份有限公司所有。<br>
-</p>
-<hr>
-
-<h3>六、后续开发计划</h3>
-<p>
-本项目为 <a href="{REPO_PAGE}">Pilot-KG</a> 系列的前置项目，<br>
-后续将扩展为跨平台、可自定义主题与素材、具备知识获取与匿名聊天能力的桌面助手。
-</p>
-
-<hr>
-"""
+# 帮助文档文件名（v3.8 起 HTML 独立成文件，不再硬编码在本模块里）
+HELP_FILE = 'help.html'
 
 
-class ManagerPanel(QDialog):
+def app_icon(base_dir, fallback_pixmap=None):
+    """取应用图标：优先用磁盘上的 ``icon256.ico``，否则退回伙伴当前帧。
+
+    **为什么任务栏图标要用这个**：面板在任务栏有独立条目后，
+    任务栏显示的就是这个图标。若不给``setWindowIcon``，Windows 会拿
+    exe 的图标（PyInstaller 已嵌入，但在开发态是PySide6 默认图标）。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(base_dir, 'icon256.ico'),
+                 os.path.join(here, 'icon256.ico'),
+                 os.path.join(base_dir, '_internal', 'icon256.ico')):
+        if os.path.isfile(path):
+            icon = QIcon(path)
+            if not icon.isNull():
+                return icon
+    return QIcon(fallback_pixmap) if fallback_pixmap is not None else QIcon()
+
+
+def help_file_candidates(base_dir):
+    """返回可能的帮助文件路径（按优先级）。
+
+    v3.8 起帮助页是独立文件 ``res/help.html``，随安装包进 ``_internal``：
+
+    - 打包后 ``base_dir`` 就是 ``_internal``（pilot.py 的 BASE_DIR 指向那里），
+      故第一条命中；
+    - 从源码运行时 ``base_dir`` 是项目根，文件在 ``res/`` 子目录下，
+      故第二条命中——**注意是 here/res 而不是 here 的父目录/res**，
+      写错成父目录会导致开发态永远读不到帮助文件（且因为有兜底提示，
+      不报错、只是帮助页变空白，很难发现）。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        os.path.join(base_dir, HELP_FILE),
+        os.path.join(here, HELP_FILE),
+        os.path.join(here, 'res', HELP_FILE),
+    ]
+
+
+def load_help_html(base_dir, app_version=APP_VERSION, repo_url=REPO_URL,
+                   repo_page=REPO_PAGE):
+    """读取帮助文档 HTML 并填入版本等占位符；读不到时返回兜底提示页。
+
+    文件里的占位符写成 ``{{APP_VERSION}}`` 这种**双花括号**形式——
+    若沿用单花括号，HTML 里的 CSS（如 ``body { margin: 0 }``）
+    会在替换时把内容吃掉。
+
+    **不抛异常**：帮助页读不到只是文档缺失，不能因此让程序起不来。
+    """
+    candidates = help_file_candidates(base_dir)
+    path = next((p for p in candidates if os.path.isfile(p)), None)
+    if path is None:
+        content = (f'<h2>原神桌面伙伴 v{app_version} · 帮助文档</h2>'
+                   f'<p style="color:#c0392b"><b>未能载入帮助文件 '
+                   f'{HELP_FILE}</b></p>'
+                   f'<p>帮助文档随程序一起安装在 <code>_internal</code> 目录下。'
+                   f'若该文件缺失，可重新安装程序；源码位于仓库的 '
+                   f'<code>res/{HELP_FILE}</code>。</p>')
+    else:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except OSError as e:
+            content = (f'<h2>原神桌面伙伴 v{app_version} · 帮助文档</h2>'
+                       f'<p style="color:#c0392b">帮助文件读取失败：'
+                       f'{html.escape(str(e))}</p>')
+    return (content
+            .replace('{{APP_VERSION}}', app_version)
+            .replace('{{REPO_URL}}', repo_url)
+            .replace('{{REPO_PAGE}}', repo_page))
+
+class ManagerPanel(QMainWindow):
+    """管理面板主窗口（v3.8 起由 QDialog 升级而来）。
+
+    任务栏行为的关键是构造时的 ``super().__init__(None)`` 加显式
+    ``Qt.Window``：把 pilot 作为 parent 会让 Windows 把面板并进伙伴那个
+    无边框窗口的任务栏分组，导致任务栏上看不到独立图标。
+    伙伴（pilot）改由 :attr:`pilot` 属性引用，不再是 Qt 父子关系。
+    """
+
     def __init__(self, pilot, config):
-        super().__init__(pilot)
+        super().__init__(None)      # 不设 parent：见类文档的说明
         self.pilot = pilot
         self.store = pilot.store
         self.config = config
         # v3.4：配置以 SQLite 为准（config.db），config dict 是其内存副本
         self.config_store = pilot.config_store
         self.setWindowTitle(f'原神桌面伙伴 v{APP_VERSION} · 管理面板')
-        # 窗口图标：与系统托盘一致，使用当前伙伴的当前帧（不依赖磁盘路径）
-        if pilot._frames:
-            self.setWindowIcon(QIcon(pilot._frames[pilot.index][0]))
-        self.resize(960, 620)
+        self.setWindowIcon(self._app_icon())
 
-        layout = QVBoxLayout(self)
-        self.tabs = QTabWidget(self)
+        # 显式声明标准窗口：带标题栏与最小化/最大化/关闭按钮，
+        # 并在任务栏占一个独立条目（不写这一句，任务栏上会找不到面板）
+        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)   # 关闭只隐藏，不销毁
+        self.resize(960, 620)
+        self.setMinimumSize(720, 480)
+
+        # 标签页放在中央控件里（QMainWindow 的标准结构）
+        central = QWidget(self)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(8, 6, 8, 6)
+        self.tabs = QTabWidget(central)
         layout.addWidget(self.tabs)
+        self.setCentralWidget(central)
 
         self._build_roles_tab()
         self._build_music_tab()
         self._build_assets_tab()
         self._build_kg_tab()
+        self._build_window_tab()
         self._build_help_tab()
+        self._build_shortcuts()
         # 知识图谱页首次被打开时才加载数据（1900+ 节点，避免拖慢面板启动）
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.refresh()
 
+    def _app_icon(self):
+        """面板图标：磁盘上的 icon256.ico 优先，缺文件时退回当前伙伴帧。
+
+        不依赖资源库：打包后ico 在 ``_internal`` 里，
+        而开发时资源又在 assets.db 中，两条路径都可能取不到。
+        """
+        return app_icon(getattr(self.store, 'base_dir', os.curdir),
+                        self.pilot._frames[self.pilot.index][0]
+                        if getattr(self.pilot, '_frames', None) else None)
+
+    def _build_shortcuts(self):
+        """给六个标签页各绑一个 Ctrl+数字 快捷键。
+
+        面板没有菜单栏，标签页就是唯一的导航入口；但逐个点标签
+        在宽屏上有点来回。用 <code>Ctrl+1</code> ~ <code>Ctrl+6</code>
+        直接跳过去，比菜单快捷键更省一次鼠标移动。
+
+        ⚠️ 必须在**所有标签页建好之后**调用：快捷键要按索引定位，
+        少建一个就会绑到错位的页面上。
+        """
+        for index in range(self.tabs.count()):
+            QShortcut(QKeySequence(f'Ctrl+{index + 1}'), self.tabs,
+                      lambda _checked=False, i=index: self.tabs.setCurrentIndex(i))
+
+    # ---------- 窗口与状态 ----------
+
+    def _build_window_tab(self):
+        """构建「窗口与状态」标签页。
+
+        v3.8 新增：原先面板没有任何窗口状态入口（不能最小化、不能最大化），
+        而为这几条命令单开一个菜单栏又多一层层级，故直接做成一个标签页：
+        上半部分是窗口命令，下半部分是当前状态。
+        """
+        tab = QWidget()
+        root = QVBoxLayout(tab)
+
+        # ① 窗口操作：按钮文案随当前状态变化（_sync_window_state 负责同步）
+        win_box = QGroupBox('窗口操作')
+        win_layout = QVBoxLayout(win_box)
+
+        self.btn_min = QPushButton('最小化')
+        self.btn_min.setToolTip('把面板缩到任务栏，托盘图标仍在运行')
+        self.btn_min.clicked.connect(self.showMinimized)
+        self.btn_max = QPushButton('最大化')
+        self.btn_max.clicked.connect(self._toggle_maximized)
+        self.btn_full = QPushButton('全屏')
+        self.btn_full.setToolTip('全屏后按 Esc 可退出（按钮会变成「退出全屏」）')
+        self.btn_full.clicked.connect(self._toggle_fullscreen)
+        win_row1 = QHBoxLayout()
+        for btn in (self.btn_min, self.btn_max, self.btn_full):
+            btn.setFixedSize(BTN_W, BTN_H)   # 全局统一尺寸，见 BTN_W/BTN_H
+            win_row1.addWidget(btn)
+        win_row1.addStretch(1)   # 按钮保持自身尺寸，不被拉伸填满整行
+        win_layout.addLayout(win_row1)
+
+        self.btn_hide = QPushButton('隐藏面板')
+        self.btn_hide.setToolTip('隐藏面板但伙伴继续在桌面运行，可从托盘再次唤出')
+        self.btn_hide.clicked.connect(self.hide)
+        self.btn_hide.setFixedSize(BTN_W, BTN_H)
+        win_row2 = QHBoxLayout()
+        win_row2.addWidget(self.btn_hide)
+        win_row2.addStretch(1)
+        win_layout.addLayout(win_row2)
+
+        # 伙伴显隐用勾选框而非按钮：它是**状态**而非**动作**，
+        # 勾选框能同时表达「当前状态」与「点击切换」
+        self.show_pilot_check = QCheckBox('显示桌面上的伙伴')
+        self.show_pilot_check.setToolTip(
+            '取消勾选即把伙伴设为透明（同托盘菜单的「隐藏」）')
+        self.show_pilot_check.toggled.connect(self._toggle_pilot_visible)
+        win_layout.addWidget(self.show_pilot_check)
+        root.addWidget(win_box)
+
+        # ② 当前状态
+        info_box = QGroupBox('当前状态')
+        info_form = QFormLayout(info_box)
+        self.win_state_label = QLabel('-')
+        self.cur_role_label = QLabel('-')
+        self.store_label = QLabel('-')
+        self.version_label = QLabel(f'原神桌面伙伴 v{APP_VERSION}')
+        info_form.addRow('窗口状态:', self.win_state_label)
+        info_form.addRow('当前伙伴:', self.cur_role_label)
+        info_form.addRow('资源库:', self.store_label)
+        info_form.addRow('版本:', self.version_label)
+        root.addWidget(info_box)
+
+        hint = QLabel('提示：面板只关闭不退出程序——彻底结束请用托盘菜单的「退出」。'
+                      '伙伴本体只在系统托盘有图标，不占用任务栏。')
+        hint.setStyleSheet('color: #7f8c8d;')
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+        root.addStretch(1)
+
+        self.tabs.addTab(tab, '窗口与状态')
+
+    def _toggle_maximized(self):
+        """最大化 / 还原切换。"""
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _toggle_fullscreen(self):
+        """全屏 / 退出全屏切换。
+
+        全屏会盖住整个屏幕，因此除了按钮，还要允许 Esc 键退出
+        （见 :meth:`keyPressEvent`）——否则用户会被困在全屏里。
+        """
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _toggle_pilot_visible(self, checked):
+        """显示 / 隐藏桌面上的伙伴（勾选 = 显示）。
+
+        走 :meth:`Pilot.set_visible` 而不是直接设透明度：那样才能让托盘
+        造成的显隐变化同步回本勾选框的状态。
+        """
+        self.pilot.set_visible(checked)
+
+    def _window_state_text(self):
+        """返回窗口状态的可读名称（多个状态同时置位时按优先级取）。"""
+        if self.isFullScreen():
+            return '全屏'
+        if self.isMinimized():
+            return '最小化'
+        if self.isMaximized():
+            return '最大化'
+        return '正常'
+
+    def _sync_window_state(self):
+        """按当前状态更新「窗口与状态」页的按钮文字、勾选与状态标签。
+
+        窗口状态变化（最小化 / 最大化 / 全屏）时由 changeEvent 调用；
+        :meth:`Pilot.set_visible` 在托盘侧改变显隐时也回调这里。
+        """
+        if not hasattr(self, 'btn_max'):     # 标签页尚未建好（构造早期）
+            return
+        maximized = self.isMaximized()
+        self.btn_max.setText('还原' if maximized else '最大化')
+        full = self.isFullScreen()
+        self.btn_full.setText('退出全屏' if full else '全屏')
+
+        # 伙伴本体是「透明隐藏」，故用 opacity 判断可见性而不是 isVisible
+        visible = self.pilot.windowOpacity() > 0
+        if visible != self.show_pilot_check.isChecked():
+            self.show_pilot_check.blockSignals(True)   # 避免程序性勾选触发回调
+            self.show_pilot_check.setChecked(visible)
+            self.show_pilot_check.blockSignals(False)
+
+        self.win_state_label.setText(self._window_state_text())
+
+    def changeEvent(self, event):
+        """窗口状态变化时刷新「窗口与状态」页。
+
+        必须调 ``super().changeEvent(event)``：QMainWindow 靠这个事件
+        维护自身状态（如 QLabel 的尺寸 hint），漏掉会导致界面显示异常。
+        """
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_window_state()
+
+    def keyPressEvent(self, event):
+        """Esc 退出全屏。
+
+        全屏时标签页与标题栏控件都可能被盖住，若没有这个 Esc 退出路径，
+        用户就得靠 Alt+Tab 切出去才能恢复——这是全屏最常见的坑。
+        """
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            return
+        super().keyPressEvent(event)
+
     def _on_tab_changed(self, index):
+        """切到知识图谱页时才加载图谱数据（大库首次加载约 0.7 秒）。"""
         if self.tabs.tabText(index) == '知识图谱':
             self._ensure_kg_loaded()
 
@@ -343,18 +365,14 @@ class ManagerPanel(QDialog):
         self.kg_search.returnPressed.connect(self._on_kg_search)
         top.addWidget(self.kg_search)
         search_btn = QPushButton('定位')
+        search_btn.setFixedSize(BTN_W, BTN_H)
         search_btn.clicked.connect(self._on_kg_search)
         top.addWidget(search_btn)
         top.addStretch(1)
-        for text, slot, tip in (
-                ('导入 CSV', self._on_kg_import, '从 CSV 文件或目录导入图谱数据'),
-                ('导出 CSV', self._on_kg_export, '把当前图谱导出为 CSV 目录'),
-                ('重新载入', self._on_kg_reload, '丢弃内存改动，从数据库重新载入'),
-        ):
-            btn = QPushButton(text)
-            btn.setToolTip(tip)
-            btn.clicked.connect(slot)
-            top.addWidget(btn)
+        # 说明：CSV 导入/导出/重新载入已移到「素材管理」页（与素材的导入导出放一起）
+        tip = QLabel('数据导入导出见「素材管理」页')
+        tip.setStyleSheet('color: #7f8c8d;')
+        top.addWidget(tip)
         root.addLayout(top)
 
         # 中部：画布 + 详情/关系/操作
@@ -385,7 +403,9 @@ class ManagerPanel(QDialog):
         self.kg_del_node_btn = QPushButton('删除实体')
         self.kg_del_node_btn.clicked.connect(self._on_kg_delete_node)
         for btn in (self.kg_add_node_btn, self.kg_edit_node_btn, self.kg_del_node_btn):
+            btn.setFixedSize(BTN_W-40, BTN_H)
             node_row.addWidget(btn)
+        node_row.addStretch(1)
         side_layout.addLayout(node_row)
 
         rel_row = QHBoxLayout()
@@ -396,7 +416,9 @@ class ManagerPanel(QDialog):
         self.kg_del_rel_btn = QPushButton('删除关系')
         self.kg_del_rel_btn.clicked.connect(self._on_kg_delete_edge)
         for btn in (self.kg_add_rel_btn, self.kg_edit_rel_btn, self.kg_del_rel_btn):
+            btn.setFixedSize(BTN_W-40, BTN_H)
             rel_row.addWidget(btn)
+        rel_row.addStretch(1)
         side_layout.addLayout(rel_row)
 
         side.setMaximumWidth(320)
@@ -453,14 +475,29 @@ class ManagerPanel(QDialog):
             '<p>也可直接新增实体与关系，或用「导入 CSV」合并外部图谱数据。</p>')
         self._kg_ready = True
         self._sync_kg_buttons()
+        self._update_kg_stat()      # 素材管理页的图谱统计随之更新
         return True
 
     def _kg_refresh_completer(self):
         self.kg_completer.setModel(QStringListModel(self.kg.all_names()))
 
+    def _update_kg_stat(self):
+        """素材管理页「知识图谱数据」分组的统计文本（图谱未载入时只提示位置）。"""
+        if not hasattr(self, 'stat_kg'):
+            return
+        if getattr(self, '_kg_ready', False) and getattr(self, 'kg', None) is not None:
+            ks = self.kg.stats()
+            self.stat_kg.setText(
+                f"SQLite (kg.db) · {ks['nodes']} 实体 / {ks['edges']} 关系")
+        else:
+            self.stat_kg.setText('SQLite (kg.db) · 打开「知识图谱」页后载入')
+
     def _kg_update_status(self):
         s = self.kg.stats()
-        size = f' · 库 {s["db_size_mb"]:.1f} MB' if s['db_size_mb'] is not None else ''
+        # db_size_mb 的类型是 float | None（文件后端时没有库文件），
+        # 必须先判空再格式化，否则类型检查器报「不支持格式规范」
+        size_mb = s['db_size_mb']
+        size = f' · 库 {float(size_mb):.1f} MB' if size_mb is not None else ''
         # 附带数据来源（构建来源 / 版本），既是构建追溯，也便于将来核对服务器下发
         info = self.kg.info() if hasattr(self.kg, 'info') else {}
         origin = info.get('built_from', 'unknown')
@@ -468,6 +505,7 @@ class ManagerPanel(QDialog):
         tail = f' · 来源 {origin}' + (f' v{app_v}' if app_v and app_v != 'unknown' else '')
         self.kg_status.setText(
             f'实体 {s["nodes"]} 个 · 关系 {s["edges"]} 条 · 存储 SQLite (kg.db){size}{tail}')
+        self._update_kg_stat()      # 图谱变化后素材管理页的统计同步
 
     def _on_kg_search(self):
         if not self._ensure_kg_loaded():
@@ -694,42 +732,63 @@ class ManagerPanel(QDialog):
     # ---------- 知识图谱：导入 / 导出 / 重载 ----------
 
     def _on_kg_import(self):
-        """导入入口：先选来源类型（图谱目录最贴合原始布局，单文件用于补充零散表）。"""
+        """导入 CSV：选来源类型（目录 / 单文件），再选合并或覆盖。
+
+        对话框只有**一层**——选定来源后紧接着问合并/覆盖，导出结果
+        用同一套标准按钮呈现。原先这里先弹一个自建的三按钮 QMessageBox、
+        再弹一个 Yes/No/Cancel，语义混乱（"确定" 到底是选哪个？）且容易
+        在取消后仍往下走。
+        """
         if not self._ensure_kg_loaded():
             return
         box = QMessageBox(self)
         box.setWindowTitle('导入知识图谱')
-        box.setText('选择要导入的内容：')
-        dir_btn = box.addButton('CSV 目录（含 label-*.csv / rel-*.csv）',
-                                QMessageBox.ButtonRole.AcceptRole)
-        file_btn = box.addButton('单个 CSV 文件', QMessageBox.ButtonRole.AcceptRole)
-        box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText('请选择要导入的内容：')
+        box.setInformativeText(
+            '• CSV 目录：含 label-*.csv 与 rel-*.csv，是知识图谱的完整原始布局\n'
+            '• 单个 CSV：只导入一张表（实体表或关系表），用于补充零散数据')
+        dir_btn = box.addButton('CSV 目录…', QMessageBox.ButtonRole.AcceptRole)
+        file_btn = box.addButton('单个 CSV 文件…', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
         box.exec()
-        if box.clickedButton() is dir_btn:
+        clicked = box.clickedButton()
+        if clicked is dir_btn:
             path = QFileDialog.getExistingDirectory(
                 self, '选择知识图谱 CSV 目录')
-        elif box.clickedButton() is file_btn:
+        elif clicked is file_btn:
             path, _ = QFileDialog.getOpenFileName(
                 self, '选择知识图谱 CSV（实体表或关系表）', '', 'CSV 文件 (*.csv)')
         else:
-            return
-        if path:
-            self._kg_do_import(path)
+            return                      # 取消或直接关窗：什么都不做
+        if not path:
+            return                      # 在文件对话框里取消
+        self._kg_do_import(path)
 
     def _kg_do_import(self, path):
-        """导入前确认合并/覆盖，覆盖模式会清空现有图谱。"""
+        """导入前确认合并 / 覆盖（覆盖会清空现有图谱），取消则不执行。"""
         s = self.kg.stats()
-        ret = QMessageBox.question(
-            self, '导入知识图谱',
-            f'将导入：{os.path.basename(path)}\n\n'
-            f'当前库中有实体 {s["nodes"]} 个、关系 {s["edges"]} 条。\n\n'
-            f'确定 = 合并（同名实体覆盖属性）\n'
-            f'取消 = 覆盖（先清空现有图谱）',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            | QMessageBox.StandardButton.Cancel)
-        if ret == QMessageBox.StandardButton.Cancel:
-            return
-        replace = ret == QMessageBox.StandardButton.No
+        box = QMessageBox(self)
+        box.setWindowTitle('导入知识图谱')
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f'确定把「{os.path.basename(path)}」导入当前图谱吗？')
+        box.setInformativeText(
+            f'当前库：实体 {s["nodes"]} 个、关系 {s["edges"]} 条。\n\n'
+            f'合并：保留现有内容，同名实体的属性被导入值覆盖\n'
+            f'覆盖：先清空当前图谱再导入（原内容将丢失）')
+        merge_btn = box.addButton('合并', QMessageBox.ButtonRole.AcceptRole)
+        replace_btn = box.addButton('覆盖', QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(merge_btn)     # 默认走安全的那条路
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is merge_btn:
+            replace = False
+        elif clicked is replace_btn:
+            replace = True
+        else:
+            return                          # 取消 / 关窗：不导入
         try:
             report = self.kg.import_csv(path, replace=replace)
         except Exception as e:
@@ -781,7 +840,9 @@ class ManagerPanel(QDialog):
         tab = QWidget()
         root = QVBoxLayout(tab)
         browser = QTextBrowser()
-        browser.setHtml(HELP_HTML)
+        # v3.8：HTML 独立成 res/help.html，程序启动时动态读取，
+        # 不再把大段帮助文案硬编码在 manager_panel.py 里
+        browser.setHtml(load_help_html(getattr(self.store, 'base_dir', os.curdir)))
         browser.setOpenExternalLinks(True)  # 链接交给系统浏览器打开
         root.addWidget(browser)
         self.tabs.addTab(tab, '帮助文档')
@@ -837,9 +898,10 @@ class ManagerPanel(QDialog):
         self.set_current_btn.clicked.connect(self._set_current_role)
         self.delete_btn = QPushButton('删除此人物')
         self.delete_btn.clicked.connect(self._delete_role)
-        btn_row.addWidget(self.apply_btn)
-        btn_row.addWidget(self.set_current_btn)
-        btn_row.addWidget(self.delete_btn)
+        for btn in (self.apply_btn, self.set_current_btn, self.delete_btn):
+            btn.setFixedSize(BTN_W, BTN_H)   # 全局统一尺寸，见 BTN_W/BTN_H
+            btn_row.addWidget(btn)
+        btn_row.addStretch(1)
         right.addLayout(btn_row)
         right.addStretch(1)
 
@@ -932,8 +994,10 @@ class ManagerPanel(QDialog):
         self.play_bgm_btn.clicked.connect(self._play_selected_area)
         self.stop_bgm_btn = QPushButton('停止背景音乐')
         self.stop_bgm_btn.clicked.connect(self._stop_bgm)
-        bgm_row.addWidget(self.play_bgm_btn)
-        bgm_row.addWidget(self.stop_bgm_btn)
+        for btn in (self.play_bgm_btn, self.stop_bgm_btn):
+            btn.setFixedSize(BTN_W, BTN_H)
+            bgm_row.addWidget(btn)
+        bgm_row.addStretch(1)
         right.addWidget(bgm_box)
 
         self.bgm_state_label = QLabel('-')
@@ -947,6 +1011,7 @@ class ManagerPanel(QDialog):
         right.addWidget(voice_box)
 
         self.mute_all_btn = QPushButton('关闭所有声音')
+        self.mute_all_btn.setFixedSize(BTN_W, BTN_H)
         self.mute_all_btn.clicked.connect(self._mute_all)
         right.addWidget(self.mute_all_btn)
         right.addStretch(1)
@@ -1001,10 +1066,7 @@ class ManagerPanel(QDialog):
         root.addWidget(stats_box)
 
         # 导入与导出是**两个独立模块**（各自分组），但按钮尺寸保持一致——
-        # 同一行的 QPushButton 默认 sizePolicy 会被拉伸成等宽，文字长短仍会
-        # 导致观感不齐，因此显式锁定为同一固定尺寸。导入、导出、配置三组通用。
-        BTN_W, BTN_H = 132, 32
-
+        # 尺寸由模块级常量 BTN_W/BTN_H 统一设定，五个页面全部共用。
         import_box = QGroupBox('导入素材（新人物 / 新地区，导入后立即出现在菜单中）')
         import_row = QHBoxLayout(import_box)
         import_zip_btn = QPushButton('导入 zip 素材包')
@@ -1029,7 +1091,7 @@ class ManagerPanel(QDialog):
         self.export_scope_combo.addItem('全部素材', None)
         self.export_scope_combo.addItem('仅当前人物', 'current')
         self.export_scope_combo.setToolTip('「仅当前人物」只导出该角色的帧与语音，不含地区背景音乐')
-        self.export_scope_combo.setFixedHeight(BTN_H)
+        self.export_scope_combo.setFixedSize(BTN_W, BTN_H)
         export_dir_btn = QPushButton('导出为目录')
         export_dir_btn.setToolTip('写出 png/<角色>、music/<角色>、music/<地区> 目录树')
         export_dir_btn.clicked.connect(lambda: self._export_assets(as_zip=False))
@@ -1044,7 +1106,7 @@ class ManagerPanel(QDialog):
         root.addWidget(export_box)
 
         # 配置导入导出（v3.4：配置改由 config.db 管理）
-        cfg_box = QGroupBox('配置文件（存于 config.db，可导出备份或迁移到其他机器）')
+        cfg_box = QGroupBox('配置文件（存于 config.db，可导出 JSON 备份或迁移到其他机器）')
         cfg_layout = QVBoxLayout(cfg_box)
         cfg_form = QFormLayout()
         self.stat_config = QLabel('-')
@@ -1054,23 +1116,48 @@ class ManagerPanel(QDialog):
         cfg_layout.addLayout(cfg_form)
 
         cfg_row = QHBoxLayout()
-        export_yaml_btn = QPushButton('导出 YAML')
-        export_yaml_btn.setToolTip('导出为 data/config.yaml 同格式，便于人工编辑后回导')
-        export_yaml_btn.clicked.connect(lambda: self._export_config('yaml'))
+        # v3.8：配置导入导出一律用 JSON，不再提供 YAML
         export_json_btn = QPushButton('导出 JSON')
-        export_json_btn.setToolTip('导出为 JSON，便于程序化处理')
+        export_json_btn.setToolTip('把当前配置导出为 JSON 文件，便于备份与迁移')
         export_json_btn.clicked.connect(lambda: self._export_config('json'))
         import_cfg_btn = QPushButton('导入配置')
-        import_cfg_btn.setToolTip('从 YAML / JSON 配置文件导入，可选覆盖或合并')
+        import_cfg_btn.setToolTip('从 JSON 配置文件导入，可选覆盖或合并')
         import_cfg_btn.clicked.connect(self._import_config)
         # v3.6：移除「恢复出厂设置」——它会清空用户调好的缩放/帧率，风险大于便利。
         # 需要恢复出厂值时删掉 config.db 后重新安装即可（见帮助页说明）。
         # 与导入/导出按钮共用同一尺寸常量，三组按钮外观完全一致
-        for btn in (export_yaml_btn, export_json_btn, import_cfg_btn):
+        for btn in (export_json_btn, import_cfg_btn):
             btn.setFixedSize(BTN_W, BTN_H)
             cfg_row.addWidget(btn)
+        cfg_row.addStretch(1)   # 按钮保持自身尺寸，不被拉伸填满整行
         cfg_layout.addLayout(cfg_row)
         root.addWidget(cfg_box)
+
+        # 知识图谱数据（v3.7 从「知识图谱」页迁来，与素材的导入导出放在一起）
+        kg_box = QGroupBox('知识图谱数据（存于 kg.db，可导入 / 导出 CSV 备份或迁移）')
+        kg_layout = QVBoxLayout(kg_box)
+        kg_form = QFormLayout()
+        self.stat_kg = QLabel('-')
+        kg_form.addRow('图谱存储:', self.stat_kg)
+        kg_layout.addLayout(kg_form)
+
+        kg_row = QHBoxLayout()
+        kg_import_btn = QPushButton('导入图谱 CSV')
+        kg_import_btn.setToolTip('从 CSV 目录或单个 CSV 文件导入图谱数据（可选合并 / 覆盖）')
+        kg_import_btn.clicked.connect(self._on_kg_import)
+        kg_export_btn = QPushButton('导出图谱 CSV')
+        kg_export_btn.setToolTip('把当前图谱导出为 CSV 目录，可整目录回灌')
+        kg_export_btn.clicked.connect(self._on_kg_export)
+        kg_reload_btn = QPushButton('重新载入图谱')
+        kg_reload_btn.setToolTip('重新打开 kg.db，刷新图谱页显示')
+        kg_reload_btn.clicked.connect(self._on_kg_reload)
+        for btn in (kg_import_btn, kg_export_btn, kg_reload_btn):
+            btn.setFixedSize(BTN_W, BTN_H)
+            kg_row.addWidget(btn)
+        kg_row.addStretch(1)
+        kg_layout.addLayout(kg_row)
+        root.addWidget(kg_box)
+
         root.addStretch(1)
 
         self.tabs.addTab(tab, '素材管理')
@@ -1138,32 +1225,28 @@ class ManagerPanel(QDialog):
             f'已导出到：{report["path"]}\n\n'
             f'导出结果符合素材包格式，可用「导入素材」直接并入。')
 
-    def _export_config(self, fmt):
-        """导出配置到用户选择的路径。"""
+    def _export_config(self, fmt='json'):
+        """导出配置到用户选择的路径（v3.8 起只有 JSON）。
+
+        保留 ``fmt`` 参数是为了兼容旧调用方；任何非 json 的取值都会
+        退回 JSON，避免留下「导出 YAML」的死路径。
+        """
         try:
-            if fmt == 'json':
-                path, _ = QFileDialog.getSaveFileName(
-                    self, '导出配置为 JSON', 'pilot_config.json',
-                    'JSON 配置 (*.json)')
-            else:
-                path, _ = QFileDialog.getSaveFileName(
-                    self, '导出配置为 YAML', 'pilot_config.yaml',
-                    'YAML 配置 (*.yaml *.yml)')
+            path, _ = QFileDialog.getSaveFileName(
+                self, '导出配置为 JSON', 'pilot_config.json',
+                'JSON 配置 (*.json)')
             if not path:
                 return
-            if fmt == 'json':
-                self.config_store.export_json(path)
-            else:
-                self.config_store.export_yaml(path)
+            self.config_store.export_json(path)
         except Exception as e:
             QMessageBox.warning(self, '导出失败', str(e))
             return
         QMessageBox.information(self, '导出完成', f'配置已导出到：\n{path}')
 
     def _import_config(self):
-        """导入配置文件，先确认覆盖或合并。"""
+        """导入 JSON 配置文件，先确认覆盖或合并。"""
         path, _ = QFileDialog.getOpenFileName(
-            self, '选择配置文件', '', '配置文件 (*.yaml *.yml *.json)')
+            self, '选择配置文件', '', 'JSON 配置 (*.json)')
         if not path:
             return
         ret = QMessageBox.question(
@@ -1250,13 +1333,39 @@ class ManagerPanel(QDialog):
         self.stat_areas.setText(str(s['areas']))
         self.stat_frames.setText(str(s['frames']))
         self.stat_voices.setText(str(s['voices']))
-        self.stat_size.setText(f"{s['db_size_mb']:.1f} MB" if s['db_size_mb'] is not None else '-')
+        # db_size_mb 是 float | None（文件后端无库文件），先判空再格式化
+        size_mb = s['db_size_mb']
+        self.stat_size.setText(f'{float(size_mb):.1f} MB' if size_mb is not None else '-')
 
         cs = self.config_store.stats()
+        # 同理：db_size_kb 也显式转 float，避免联合类型触发格式规范警告
         self.stat_config.setText(
-            f"SQLite ({os.path.basename(cs['db_path'])}) · {cs['db_size_kb']:.0f} KB")
+            f"SQLite ({os.path.basename(cs['db_path'])}) · {float(cs['db_size_kb']):.0f} KB")
         self.stat_config_roles.setText(str(cs['roles']))
 
+        # 知识图谱：未加载时只提示位置，不强制打开（大库首次加载约 0.7 秒）
+        self._update_kg_stat()
+        # v3.8：「窗口与状态」页的当前伙伴 / 资源库 / 窗口状态
+        self._sync_window_state()
+        self.cur_role_label.setText(self.pilot.role_name)
+        self.store_label.setText(
+            f'SQLite (assets.db) · {float(s["db_size_mb"]):.1f} MB'
+            if s.get('db_size_mb') is not None
+            else f'文件系统目录 · {s["roles"]} 人')
+
     def closeEvent(self, event):
-        self.pilot.on_manager_closed()
-        super().closeEvent(event)
+        """关闭 = 隐藏到托盘，而不是销毁面板。
+
+        v3.8 之前这里直接销毁：用户点一次关闭，下次打开就要重建整个面板
+        （丢失已填的表单、图谱也要重新加载）。现在只隐藏，
+        托盘「管理面板」可以原样唤回。
+
+        **不要在这里把 Pilot 的 ``_panel`` 置空**——那会导致下次打开时新建一个面板，
+        旧实例连同已加载的图谱一起泄漏。关闭只隐藏，实例继续由 Pilot 持有、
+        供 ``open_manager()`` 复用（见 pilot.py 中对应的注释）。
+        真正销毁只发生在 ``Pilot.quit()``。
+
+        伙伴本体（pilot）不作为 Qt 父窗口，本面板关闭不影响它继续运行。
+        """
+        event.ignore()      # 阻止真的关闭
+        self.hide()

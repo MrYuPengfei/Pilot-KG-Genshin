@@ -8,13 +8,20 @@ kg.db 那样统一管理。v3.4 起改为：
   存放标量项、``frame_scale`` 表存放人物帧率/缩放；与 ``assets.db``、``kg.db``
   三个库并列在根目录，并随安装包分发（出厂值即包内那份）；
 
-**v3.5：YAML 彻底退出运行时。** ``data/config.yaml`` 不再被程序读取，它只剩两个用途：
-① 构建输入——由 ``tools/build_databases.py`` 生成出厂 config.db；② 用户手动导入的
-交换格式（面板「导入配置」，也是后续服务器下发的载荷格式）。库为空时直接用内置
-默认值播种，再由 :meth:`ConfigStore.ensure_roles` 按 assets.db 补齐人物登记。
+**v3.5：YAML 彻底退出运行时。** ``data/config.yaml`` 不再被程序读取，只作为
+构建输入（由 ``tools/build_databases.py`` 生成出厂 config.db）。
+
+**v3.8：YAML 作为配置格式彻底退役，导入导出统一用 JSON。**
+① ``seed_path`` 指向的种子文件按 **JSON** 解析（``data/config.json``）；
+② :meth:`ConfigStore.export_json` 是唯一的导出入口，``export_yaml`` 已删除；
+③ :meth:`ConfigStore.import_file` 只接受 JSON，遇到 ``.yaml``/``.yml``
+   会明确报错而不是偷偷按 YAML 解析——避免用户以为导入成功、实际存了错数据。
+
+去掉 YAML 还有一个附带好处：``PyYAML`` 不再是运行期依赖，打包体积变小，
+也不再需要防它那个不继承 ``ValueError`` 的 ``ScannerError``。
 
 对上层只暴露 :meth:`ConfigStore.load`（返回普通 dict，调用方可照旧修改）
-与 :meth:`ConfigStore.save`（整体落库），语义与旧的 yaml 读写一致。
+与 :meth:`ConfigStore.save`（整体落库）。
 """
 
 import json
@@ -56,23 +63,24 @@ CREATE TABLE IF NOT EXISTS config_meta (
 
 
 def _as_bool(value):
-    """把配置里的布尔值统一成 bool（YAML 给出的是 True/False，JSON/文本可能是 "true"）。"""
+    """把配置里的布尔值统一成 bool（JSON 原生就是 true/false，这里兼容旧文件里的 "true"）。"""
     if isinstance(value, str):
         return value.strip().lower() in ('1', 'true', 'yes', 'on')
     return bool(value)
 
 
 class ConfigStore:
-    """配置读写：v3.5 起**运行时只读 SQLite**，YAML 不再参与。
+    """配置读写：v3.5 起**运行时只读 SQLite**，v3.8 起配置文本格式只认 JSON。
 
     库文件放在**项目根目录**（与 assets.db、kg.db 并列）。config.db 随安装包分发
     一份出厂配置；用户改动后即为本机状态，升级安装时由 setup.iss 的
     ``onlyifdoesntexist`` 保护，不会被新版本覆盖。
 
-    ``data/config.yaml`` 仅在两种场合出现：① 构建输入（tools/build_databases.py
-    生成出厂 config.db）；② 用户手动导入的交换格式。运行时不再自动读它。
+    ``data/config.json`` 仅在构建出厂库时作为种子传入（``seed_path``），
+    运行时与导入导出都不再经过任何外部文本文件。
 
-    ``seed_path`` 显式传入时才用作播种来源（构建脚本与测试用）。
+    ``seed_path`` 显式传入时才用作播种来源（构建脚本与测试用），
+    且按 **JSON** 解析；路径存在但内容损坏时静默退回内置默认值。
     """
 
     #: 出厂配置：内置默认值 + 人物登记由调用方按 assets.db 补齐（见 ensure_roles）
@@ -82,7 +90,9 @@ class ConfigStore:
                  auto_seed=True):
         self.base_dir = base_dir
         self.db_path = os.path.join(base_dir, db_name)
-        # 仅当显式传入 seed_path 时才读 YAML；否则库空则用内置默认值
+        # 仅当显式传入 seed_path 时才读种子文件（JSON）；否则库空则用内置默认值
+        self.seed_path = seed_path
+        # 兼容旧属性名：曾用 yaml_path 表示「种子路径」，改名后仍有代码引用它
         self.yaml_path = seed_path
         os.makedirs(base_dir, exist_ok=True)
         # check_same_thread=False：面板与主线程交替读写，均为短事务
@@ -93,7 +103,7 @@ class ConfigStore:
         if self.get_meta('schema_version') is None:
             self.set_meta('schema_version', SCHEMA_VERSION)
         if auto_seed and self._is_empty():
-            self._seed_from_yaml()
+            self._seed_from_file()
 
     # ---------- 内部 ----------
 
@@ -101,37 +111,33 @@ class ConfigStore:
         row = self._conn.execute('SELECT COUNT(*) FROM kv').fetchone()
         return not row or row[0] == 0
 
-    def _seed_from_yaml(self):
-        """播种：优先用显式指定的 YAML 种子，否则用内置默认值。
+    def _seed_from_file(self):
+        """播种：优先用显式指定的 JSON 种子，否则用内置默认值。
 
         运行时（未传 seed_path）走的是「内置默认值 + 调用方 ensure_roles 按
-        assets.db 补齐人物登记」这条路径，因此不依赖任何 YAML 文件。
+        assets.db 补齐人物登记」这条路径，因此不依赖任何种子文件。
         """
-        config = self._read_yaml(self.yaml_path) if self.yaml_path else None
+        config = self._read_json(self.seed_path) if self.seed_path else None
         if config is None:
             self.save(dict(DEFAULTS))
             self.set_meta('seeded_from', 'defaults')
         else:
             self.save(config)
-            self.set_meta('seeded_from', self.yaml_path)
+            self.set_meta('seeded_from', self.seed_path)
 
     @staticmethod
-    def _read_yaml(path):
-        """读 YAML 配置；文件缺失或解析失败返回 None（不抛异常，交由调用方兜底）。
+    def _read_json(path):
+        """读 JSON 种子文件；文件缺失或解析失败返回 None（不抛异常，交由调用方兜底）。
 
-        yaml.YAMLError 的子类里既有解析错误也有读取错误，这里统一按「无法识别」
-        处理——配置是可选输入，为它抛异常只会让程序起不来。
+        配置是可选输入，为它抛异常只会让程序起不来——所以
+        ``json.JSONDecodeError`` / ``OSError`` / ``UnicodeDecodeError`` 全部吞掉。
         """
         if not path or not os.path.isfile(path):
             return None
         try:
-            import yaml
-        except ImportError:
-            return None
-        try:
             with open(path, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f)
-        except Exception:      # 含 yaml.YAMLError / OSError / UnicodeDecodeError
+                data = json.load(f)
+        except Exception:      # 含 JSONDecodeError / OSError / UnicodeDecodeError
             return None
         return data if isinstance(data, dict) and data else None
 
@@ -239,7 +245,7 @@ class ConfigStore:
     def ensure_roles(self, roles, interval=60, scale=1.0):
         """为尚未登记的人物补上默认帧率/缩放，返回新增的角色名列表。
 
-        安装包不带 data/config.yaml 时配置由内置默认值播种，其中只登记了一个
+        安装包不带配置种子文件时配置由内置默认值播种，其中只登记了一个
         硬编码角色；这里以资源库（assets.db）中实际存在的人物为准补齐，使人物
         菜单与设置面板在无配置文件时也能正常工作。已登记的不会被覆盖。
         """
@@ -273,18 +279,8 @@ class ConfigStore:
 
     # ---------- 导入 / 导出 ----------
 
-    def export_yaml(self, path):
-        """导出为 YAML（与旧 config.yaml 同格式，可直接回灌或人工编辑）。"""
-        import yaml
-        config = self.load()
-        os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            yaml.dump(config, f, default_flow_style=False, allow_unicode=True,
-                      sort_keys=False)
-        return path
-
     def export_json(self, path):
-        """导出为 JSON。"""
+        """导出为 JSON（v3.8 起这是**唯一**的配置文件格式）。"""
         config = self.load()
         os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
@@ -292,7 +288,7 @@ class ConfigStore:
         return path
 
     def import_file(self, path, replace=True):
-        """从 YAML/JSON 配置文件导入，返回报告 dict。
+        """从 JSON 配置文件导入，返回报告 dict。
 
         ``replace=True`` 覆盖现有配置；``False`` 时只补充缺失的人物登记，
         不改动已有标量项（人物/地区资源以 assets.db 为准，配置跟随即可）。
@@ -336,27 +332,24 @@ class ConfigStore:
         return report
 
     def _load_config_file(self, path):
-        """按扩展名与内容嗅探读取 YAML/JSON 配置。
+        """按 JSON 读取配置文件（v3.8 起只支持 JSON）。
 
-        两种格式都尝试一遍：YAML 是 JSON 的超集，先试 JSON 可避免
-        ``.yaml`` 里装着 JSON 时被 YAML 解析成字符串。
+        对 ``.yaml``/``.yml`` **明确报错**而不是尝试按 YAML 解析：
+        静默兼容一个已宣布退役的格式，会让用户以为导入成功，
+        实际却把 YAML 解析出来的意外结构写进了配置库。
         """
         if not os.path.isfile(path):
             raise FileNotFoundError(f'配置文件不存在: {path}')
         ext = os.path.splitext(path)[1].lower()
-        if ext == '.json':
-            data = self._try_json(path)
-            if data is None:
-                raise ValueError('JSON 解析失败或内容不是配置对象')
-            return data
-        data = self._read_yaml(path)
-        if data:
-            return data
-        # 扩展名不可靠时再试一次 JSON（部分用户会改后缀）
+        if ext in ('.yaml', '.yml'):
+            raise ValueError(
+                'YAML 配置已不再支持（v3.8 起只用 JSON）。'
+                '请把该文件另存为 .json 后再导入。')
         data = self._try_json(path)
         if data:
             return data
-        raise ValueError('无法识别的配置文件格式（支持 YAML 或 JSON）')
+        # 后缀不是 .json 也照样按 JSON 读：有人会把 JSON 存成 .txt/.conf
+        raise ValueError('无法识别的配置文件格式（仅支持 JSON）')
 
     @staticmethod
     def _try_json(path):
@@ -373,12 +366,12 @@ class ConfigStore:
 
         v3.5 起出厂配置 = 内置默认值；人物登记由调用方随后调
         :meth:`ensure_roles` 按 assets.db 补齐（面板的「恢复出厂设置」即如此做），
-        因此**不需要** data/config.yaml 参与。
+        因此**不需要**任何种子文件参与。
         """
         with self._conn:
             self._conn.execute('DELETE FROM kv')
             self._conn.execute('DELETE FROM frame_scale')
-        self._seed_from_yaml()
+        self._seed_from_file()
         return self.load()
 
     def close(self):
