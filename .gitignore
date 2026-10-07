@@ -36,7 +36,7 @@ build/
 dist/
 dist_data/
 inno_build/
-*.spec
+
 
 __pycache__/
 

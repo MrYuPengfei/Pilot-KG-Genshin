@@ -1,11 +1,14 @@
 # 原神-桌面伙伴
+
 ## 项目名称Pilot-KG-Genshin
+
 pilot (名词)飞行员；（航空器）驾驶员；
 pilot (形容词)试验性的；试点的；
 KG （KnowledgeGraph）知识图谱;
 Genshin （一款游戏）原神；
 
 ## 项目介绍
+
 该项目为通用Pilot-KG的前置项目，在不断迭代该项目的过程中，逐渐实现一个跨平台、可以自定义主题和素材、具备知识获取能力和匿名聊天功能的桌面小工具。
 
 打造一个桌面端小助手，通过大规模的文本数据训练原神领域的文本预训练模型， 利用收集到的三元组数据搭建原神知识图谱，通过预训练模型进行语音识别和智能问答，通过语音合成技术来帮助回答用户问题。
@@ -31,16 +34,19 @@ Pilot-KG-Genshin/
 ├── data/                    ⚠️ 仅构建输入：既不入 git、也不随安装包分发
 │   ├── config.json          出厂配置种子（构建 config.db 用，v3.8 起为 JSON）
 │   └── csv/                 知识图谱初始 CSV（27 个，构建 kg.db 用）
+|   └── png/、music/         原始素材目录（打包进 assets.db 后可不分发）
 ├── res/
 │   └── help.html          帮助文档（v3.8 外置，启动时动态读取）
 ├── ico/                     图标（icon256.ico / .bmp、app_icon.ico、logo.ico）
 ├── tools/                   构建、命令行与数据采集工具
 ├── tests/                   pytest 测试
-└── png/、music/             原始素材目录（打包进 assets.db 后可不分发）
+...
 ```
 
 #### 安装教程
+
 A：Terminal/cmd（终端操作）
+
 1. git clone https://github.com/MrYuPengfei/Pilot-KG-Genshin.git 克隆项目。
 2. cd Pilot-KG-Genshin 进入目录，使用 `uv sync` 安装依赖。
 3. **构建三个数据库**：安装包只带 SQLite 库与 help.html，不含 CSV/JSON 配置——它们是构建输入。运行 `uv run python tools/build_assets_db.py` 与 `uv run python tools/build_databases.py` 生成 `assets.db` / `kg.db` / `config.db`。克隆后的仓库里这三个库都不存在（已入 `.gitignore`），必须先构建。
@@ -92,18 +98,21 @@ B：Windows 安装包（免环境）
    - 帮助文档：素材导入注意事项、版本变更记录、第三方开源库与许可说明。
 7. 内置人物（28 位）：七七、优菈、八重神子、刻晴、可莉、夜兰、宵宫、早柚、枫原万叶、珊瑚宫心海、班尼特、琴、甘雨、神里绫人、神里绫华、胡桃、芭芭拉、荒泷一斗、莫娜、菲谢尔、行秋、达达利亚、迪卢克、迪奥娜、钟离、阿贝多、雷电将军、魈；内置背景音乐地区：蒙德、璃月、稻妻。
 
-
 #### 界面展示
 
 ![知识图谱·可莉](exhibition/data/Snipaste_2026-10-04_11-00-37.png)
 ![知识图谱·关系清单](exhibition/data/Snipaste_2026-10-04_11-01-27.png)
 ![人物管理](exhibition/data/Snipaste_2026-10-04_10-59-35.png)
 ![素材管理](exhibition/data/Snipaste_2026-10-04_10-59-43.png)
+
 #### windows任务栏显示菜单
 
 ![托盘菜单](exhibition/data/Snipaste_2026-10-04_10-56-03.png)
+
 ### 知识图谱设计和展示
+
 #### 节点设计（12类）<br>
+
 人物：character<br>
 武器：weapon<br>
 神之眼：element<br>
@@ -116,7 +125,9 @@ B：Windows 安装包（免环境）
 怪物：master<br>
 料理：food<br>
 圣遗物：artifacts<br>
+
 #### 关系设计（14类）<br>
+
 人物-神之眼是-神之眼<br>
 人物-特殊料理是-料理<br>
 人物-来自-国家<br>
@@ -134,7 +145,6 @@ B：Windows 安装包（免环境）
 武器-突破材料是-材料<br>
 ![知识图谱设计](exhibition/data/知识图谱.jpg)
 ![图数据库](exhibition/data/neo4j.png)
-
 
 #### 版本记录
 
@@ -178,15 +188,15 @@ QT_QPA_PLATFORM=offscreen SDL_AUDIODRIVER=dummy uv run python pilot.py
 ```
 
 #### 规划中
+
 1. ✅ 基于原神信息的知识图谱（数据见 `data/csv/`，可视化见管理面板「知识图谱」页）
 2. ✅ 基于 RoBERTa 预训练模型对原神数据进行继续预训练（https://gitee.com/fg_slash/GenshinBert ）
 3. ❎ 用户语音输入、语音识别、意图识别
 4. ❎ 部分人物的语音合成、自动问答
 5. ❎ 音量调节面板化（当前依赖系统音量条）
 
-
-
 #### 参与贡献
+
 1. 知识一个默默无闻的60级小萌新罢了。
 2. 原项目：https://github.com/fg0521/Genshin-Impact-Desktoppet.git
 3. 绿幕素材来源于B站UP:皮皮虾米锅巴
