@@ -2,7 +2,7 @@
 
 两个对话框都是「先在内存里改字段，点确定后由调用方落库」的模式：
 - :class:`NodeEditDialog` 编辑类型、名称与任意键值属性（属性表格可增删行）；
-- :class:`EdgeEditDialog` 编辑两端实体与关系名，支持方向翻转。
+- :class:`EdgeEditDialog` 编辑两端实体、关系名与权重，支持方向翻转。
 
 实体选择统一用 :class:`EntityPicker`：可输入的搜索框 + 补全列表，
 既可选已有实体，也可直接输入新名字（此时按所选类型新建）。
@@ -12,10 +12,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                                QLabel, QLineEdit, QComboBox, QPushButton,
                                QDialogButtonBox, QTableWidget, QTableWidgetItem,
-                               QHeaderView, QWidget, QCompleter, QAbstractItemView)
+                               QHeaderView, QWidget, QCompleter, QAbstractItemView,
+                               QDoubleSpinBox, QCheckBox)
 from PySide6.QtGui import QStandardItemModel, QStandardItem
 
-from kg_store import NODE_TYPES, REL_NAMES, type_cn
+from kg_store import NODE_TYPES, REL_NAMES, type_cn, DEFAULT_WEIGHT
 
 MAX_ATTR_ROWS = 64
 
@@ -258,6 +259,19 @@ class EdgeEditDialog(QDialog):
         self.rel_hint.setStyleSheet('color: #27ae60;')
         self.rel_edit.textChanged.connect(self._update_hint)
 
+        # 权重：0~10 的一位小数，覆盖 csv-edu 的 1~10 评分，也够表达 0~1 相似度。
+        # 勾上「无权重」时禁用输入框并按默认值落库——默认权重不该被当成"权重是 1"。
+        self.weight_none = QCheckBox('无权重')
+        self.weight_spin = QDoubleSpinBox()
+        self.weight_spin.setRange(0.0, 10.0)
+        self.weight_spin.setSingleStep(0.5)
+        self.weight_spin.setDecimals(1)
+        self.weight_spin.setValue(DEFAULT_WEIGHT)
+        self.weight_none.toggled.connect(self.weight_spin.setDisabled)
+        weight_row = QHBoxLayout()
+        weight_row.addWidget(self.weight_none)
+        weight_row.addWidget(self.weight_spin, 1)
+
         swap_btn = QPushButton('⇄  交换两端')
         swap_btn.clicked.connect(self._swap)
 
@@ -269,6 +283,7 @@ class EdgeEditDialog(QDialog):
         rel_row.addWidget(swap_btn)
         form.addRow('关系:', rel_row)
         form.addRow('', self.rel_hint)
+        form.addRow('权重:', weight_row)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self._on_accept)
@@ -283,7 +298,15 @@ class EdgeEditDialog(QDialog):
             self.src.set_key(s_key)
             self.dst.set_key(d_key)
             self.rel_edit.setText(rel)
+            # 回填已有权重；用 edge_weight 而非直接读，边方向由存储层判定
+            w = self.kg.edge_weight(s_key, rel, d_key) if self.kg else DEFAULT_WEIGHT
+            if w != DEFAULT_WEIGHT:
+                self.weight_none.setChecked(False)
+                self.weight_spin.setValue(w)
+            else:
+                self.weight_none.setChecked(True)
         else:
+            self.weight_none.setChecked(True)     # 新增默认「无权重」
             if anchor:
                 self.src.set_key(anchor)
             if exclude:
@@ -310,5 +333,10 @@ class EdgeEditDialog(QDialog):
         self.accept()
 
     def values(self):
-        """返回 (src_key, rel, dst_key)，任一端为空则为 None。"""
-        return self.src.key(), self.rel_edit.text().strip(), self.dst.key()
+        """返回 (src_key, rel, dst_key, weight)，任一端为空则 src 为 None。
+
+        ``weight`` 在勾选「无权重」时是 ``None``（而非 1.0）——让调用方能
+        区分「明确无权重」与「权重恰好等于默认值」。
+        """
+        weight = None if self.weight_none.isChecked() else self.weight_spin.value()
+        return self.src.key(), self.rel_edit.text().strip(), self.dst.key(), weight

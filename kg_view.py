@@ -5,6 +5,10 @@
 - 双击节点：以该节点为中心重新展开（发射 nodeExpanded(key)）；
 - 滚轮缩放、左键拖拽平移；
 - 边中点标注关系名（仅中心节点的边，避免文字堆叠）。
+
+**带权重的边**：关系表带 ``weight`` 列时（如 data/csv-edu 的 1~10 评分），
+边的粗细与颜色深浅随权重变化，边标签追加权重值。全默认权重的图谱
+（weight = 1.0）渲染结果与早期版本完全一致。
 """
 
 import math
@@ -14,16 +18,62 @@ from PySide6.QtGui import QColor, QPen, QBrush, QFont, QPainter
 from PySide6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsEllipseItem,
                                QGraphicsTextItem, QGraphicsLineItem)
 
-from kg_store import NODE_TYPES
+from kg_store import NODE_TYPES, DEFAULT_WEIGHT
 
 CENTER_RADIUS = 26
 NODE_RADIUS = 15
+
+# 权重 → 视觉映射。csv-edu 用 1~10 整数评分，故上限取 10；
+# 超出范围（0~1 的相似度、0~100 的百分比）会被夹到端点，不会画成负宽度。
+WEIGHT_MAX = 10.0
+EDGE_WIDTH_MIN = 1.2
+EDGE_WIDTH_MAX = 6.0
+# 无权重边的颜色（沿用早期版本的浅灰）
+EDGE_COLOR_BASE = '#b8c2cc'
+# 有权重边的两端颜色：低权重偏浅、高权重偏深（蓝灰 → 主蓝）
+EDGE_COLOR_LOW = '#c3d0dc'
+EDGE_COLOR_HIGH = '#1f6fb2'
+
+
+def weight_ratio(weight):
+    """把权重归一化到 0.0~1.0；缺省/非法值按 0 处理。"""
+    try:
+        w = float(weight)
+    except (TypeError, ValueError):
+        return 0.0
+    if w <= DEFAULT_WEIGHT:
+        # 低于默认权重（0~1 相似度）反向映射，让「弱关系」也可见
+        return max(0.0, (w / DEFAULT_WEIGHT) * 0.25) if w > 0 else 0.0
+    return min(1.0, (w - DEFAULT_WEIGHT) / (WEIGHT_MAX - DEFAULT_WEIGHT))
+
+
+def edge_pen(weight):
+    """按权重生成边的画笔：越粗越深。"""
+    if weight is None or weight == DEFAULT_WEIGHT:
+        return QPen(QColor(EDGE_COLOR_BASE), EDGE_WIDTH_MIN)
+    r = weight_ratio(weight)
+    color = QColor(EDGE_COLOR_LOW)
+    target = QColor(EDGE_COLOR_HIGH)
+    color.setRed(int(color.red() + (target.red() - color.red()) * r))
+    color.setGreen(int(color.green() + (target.green() - color.green()) * r))
+    color.setBlue(int(color.blue() + (target.blue() - color.blue()) * r))
+    width = EDGE_WIDTH_MIN + (EDGE_WIDTH_MAX - EDGE_WIDTH_MIN) * r
+    pen = QPen(color, width)
+    pen.setCapStyle(Qt.RoundCap)
+    return pen
+
+
+def weight_text(weight):
+    """边标签里的权重后缀；默认权重不显示（避免给无权重图谱平添噪声）。"""
+    if weight is None or weight == DEFAULT_WEIGHT:
+        return ''
+    return f' {int(weight)}' if float(weight).is_integer() else f' {weight:.2f}'
 
 
 class NodeItem(QGraphicsEllipseItem):
     """图谱节点：圆形 + 下方名称标签。"""
 
-    def __init__(self, key, radius, canvas):
+    def __init__(self, key, radius, canvas, cn_name=''):
         super().__init__(-radius, -radius, radius * 2, radius * 2)
         self.key = key
         self.canvas = canvas
@@ -36,7 +86,12 @@ class NodeItem(QGraphicsEllipseItem):
         self.setPen(QPen(color.darker(130), 1.5))
         self.setZValue(2)
         self.setAcceptHoverEvents(True)
-        self.setToolTip(f'{NODE_TYPES.get(ntype, (ntype,))[0]} · {name}')
+        # 有中文名时提示里一并给出，方便英文名实体辨认
+        type_label = NODE_TYPES.get(ntype, (ntype,))[0]
+        tip = f'{type_label} · {name}'
+        if cn_name:
+            tip += f'\n{cn_name}'
+        self.setToolTip(tip)
 
         label = QGraphicsTextItem(self._short_name(name), self)
         font = QFont()
@@ -46,6 +101,16 @@ class NodeItem(QGraphicsEllipseItem):
         br = label.boundingRect()
         label.setPos(-br.width() / 2, radius - 2)
         label.setZValue(3)
+        # 中文名作为副标签（过长则截断），便于英文名实体辨认
+        if cn_name:
+            sub = QGraphicsTextItem(self._short_name(cn_name, 9), self)
+            sub_font = QFont()
+            sub_font.setPointSize(7)
+            sub.setFont(sub_font)
+            sub.setDefaultTextColor(QColor('#7f8c8d'))
+            sbr = sub.boundingRect()
+            sub.setPos(-sbr.width() / 2, radius + label.boundingRect().height() - 4)
+            sub.setZValue(3)
 
     @staticmethod
     def _short_name(name, limit=7):
@@ -135,48 +200,59 @@ class KGCanvas(QGraphicsView):
     # ---------- 绘图 ----------
 
     def show_ego(self, key):
-        """以 key 为中心绘制一跳自我中心网。"""
+        """以 key 为中心绘制一跳自我中心网。
+
+        邻居按权重从大到小排（:meth:`KGStore.neighbor_details`），强关系
+        排在前面、线也更粗，形成可读的强弱层次。
+        """
         if self.kg is None or key not in self.kg.nodes:
             return
         self.center_key = key
         self._retire_items()     # 必须在 clear 之前置标记
         self._scene.clear()
 
-        neighbors = self.kg.neighbors(key)   # 已按关系分组排序
+        # (rel, rel_cn, 对端键, 权重, 对端中文名)
+        neighbors = self.kg.neighbor_details(key)
         n = len(neighbors)
-        # 半径保证邻居间距不小于 ~44px
-        radius = max(200.0, n * 44.0 / (2 * math.pi))
+        # 半径保证邻居间距不小于 ~44px。带中文副标签时节点视觉高度多约一行，
+        # 间距按 52px 算，否则上下相邻的中文名会叠在一起。
+        has_cn = any(cn for _r, _c, _o, _w, cn in neighbors)
+        radius = max(200.0, n * (52.0 if has_cn else 44.0) / (2 * math.pi))
+
+        def place(i):
+            angle = 2 * math.pi * i / max(n, 1) - math.pi / 2
+            return radius * math.cos(angle), radius * math.sin(angle)
 
         # 先画边（置于节点下层）
-        for i, (rel, rel_cn, other) in enumerate(neighbors):
-            angle = 2 * math.pi * i / max(n, 1) - math.pi / 2
-            x, y = radius * math.cos(angle), radius * math.sin(angle)
+        for i, (rel, rel_cn, other, weight, _cn) in enumerate(neighbors):
+            x, y = place(i)
             line = QGraphicsLineItem(0, 0, x, y)
-            line.setPen(QPen(QColor('#b8c2cc'), 1.2))
+            line.setPen(edge_pen(weight))
             line.setZValue(0)
             self._scene.addItem(line)
-            # 关系标签放在 60% 处
-            text = QGraphicsTextItem(rel_cn)
+            # 关系标签放在 55% 处；有权重时把权重值一并标上
+            text = QGraphicsTextItem(f'{rel_cn}{weight_text(weight)}')
             font = QFont()
             font.setPointSize(8)
             text.setFont(font)
-            text.setDefaultTextColor(QColor('#7f8c8d'))
+            text.setDefaultTextColor(QColor('#5d6d7e'))
             br = text.boundingRect()
             text.setPos(x * 0.55 - br.width() / 2, y * 0.55 - br.height() / 2)
             text.setZValue(1)
             self._scene.addItem(text)
 
         # 中心节点
-        center = NodeItem(key, CENTER_RADIUS, self)
+        center = NodeItem(key, CENTER_RADIUS, self,
+                          self.kg.node_cn_name(key) if self.kg else '')
         center.setPos(QPointF(0, 0))
         center.setPen(QPen(QColor('#2c3e50'), 2.5))
         self._scene.addItem(center)
 
         # 邻居节点
-        for i, (rel, rel_cn, other) in enumerate(neighbors):
-            angle = 2 * math.pi * i / max(n, 1) - math.pi / 2
-            item = NodeItem(other, NODE_RADIUS, self)
-            item.setPos(QPointF(radius * math.cos(angle), radius * math.sin(angle)))
+        for i, (rel, rel_cn, other, weight, cn) in enumerate(neighbors):
+            x, y = place(i)
+            item = NodeItem(other, NODE_RADIUS, self, cn)
+            item.setPos(QPointF(x, y))
             self._scene.addItem(item)
 
         self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-80, -80, 80, 80))

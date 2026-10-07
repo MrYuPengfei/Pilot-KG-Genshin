@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 
 from asset_exporter import export_assets, _human_size
 from kg_store import (NODE_TYPES, get_default_store, reset_default_store,
-                      rel_cn, type_cn)
+                      rel_cn, type_cn, DEFAULT_WEIGHT)
 from kg_editor import NodeEditDialog, EdgeEditDialog
 from kg_view import KGCanvas
 
@@ -430,16 +430,19 @@ class ManagerPanel(QMainWindow):
         self.kg_status.setStyleSheet('color: #7f8c8d;')
         root.addWidget(self.kg_status)
 
-        legend = QLabel('　'.join(
-            f'<font color="{color}">●</font>{cn}'
-            for cn, color in NODE_TYPES.values()))
+        legend = QLabel('')
+        legend.setObjectName('kgLegend')
         legend.setTextFormat(Qt.RichText)
         legend.setStyleSheet('color: #7f8c8d;')
+        legend.setWordWrap(True)
         root.addWidget(legend)
+        self.kg_legend = legend
 
         hint = QLabel('单击节点查看详情，双击节点以其为中心展开，滚轮缩放、拖拽平移；'
-                      '右侧可编辑实体与关系')
+                      '右侧可编辑实体与关系。边越粗表示权重越高，'
+                      '节点下方小字为中文名（支持中文搜索）')
         hint.setStyleSheet('color: #7f8c8d;')
+        hint.setWordWrap(True)
         root.addWidget(hint)
 
         self.kg_canvas.nodeSelected.connect(self._on_kg_node_selected)
@@ -469,6 +472,7 @@ class ManagerPanel(QMainWindow):
         self.kg_canvas.bind(self.kg)
         self._kg_refresh_completer()
         self._kg_update_status()
+        self._kg_refresh_legend()
         self.kg_detail.setHtml(
             '<h3>原神知识图谱</h3>'
             '<p>在上方搜索框输入实体名称开始探索，例如：钟离、蒙德、护摩之杖。</p>'
@@ -477,6 +481,20 @@ class ManagerPanel(QMainWindow):
         self._sync_kg_buttons()
         self._update_kg_stat()      # 素材管理页的图谱统计随之更新
         return True
+
+    def _kg_refresh_legend(self):
+        """重建图例。
+
+        NODE_TYPES 是**可增长**的注册表：导入带新类型的图谱（csv-edu 的
+        ai / education）后必须重建，否则新类型在画布上是有颜色的点、
+        图例里却没有对应条目。只列库中真实存在的类型，避免注册表里的
+        历史类型长期占着图例位置。
+        """
+        present = {k[0] for k in self.kg.nodes} if getattr(self, 'kg', None) else set()
+        items = [f'<font color="{color}">●</font>{html.escape(cn)}'
+                 for key, (cn, color) in NODE_TYPES.items() if key in present]
+        self.kg_legend.setText('　'.join(items) if items else
+                               '<span style="color:#7f8c8d">（暂无实体类型）</span>')
 
     def _kg_refresh_completer(self):
         self.kg_completer.setModel(QStringListModel(self.kg.all_names()))
@@ -503,8 +521,12 @@ class ManagerPanel(QMainWindow):
         origin = info.get('built_from', 'unknown')
         app_v = info.get('app_version', '')
         tail = f' · 来源 {origin}' + (f' v{app_v}' if app_v and app_v != 'unknown' else '')
+        # 带权重的关系数：只在非零时提示，无权重图谱保持原样
+        weighted = s.get('weighted_edges', 0)
+        w_tail = f' · 带权重 {weighted} 条' if weighted else ''
         self.kg_status.setText(
-            f'实体 {s["nodes"]} 个 · 关系 {s["edges"]} 条 · 存储 SQLite (kg.db){size}{tail}')
+            f'实体 {s["nodes"]} 个 · 关系 {s["edges"]} 条'
+            f'{w_tail} · 存储 SQLite (kg.db){size}{tail}')
         self._update_kg_stat()      # 图谱变化后素材管理页的统计同步
 
     def _on_kg_search(self):
@@ -529,7 +551,11 @@ class ManagerPanel(QMainWindow):
             return
         self._kg_current = key
         cn_type = NODE_TYPES.get(key[0], (key[0],))[0]
-        parts = [f'<h3>{key[1]} <small style="color:#7f8c8d">[{cn_type}]</small></h3>']
+        cn_name = self.kg.node_cn_name(key)
+        title = f'{html.escape(key[1])}'
+        if cn_name:
+            title += f' <small style="color:#7f8c8d">{html.escape(cn_name)}</small>'
+        parts = [f'<h3>{title} <small style="color:#7f8c8d">[{cn_type}]</small></h3>']
         if node['attrs']:
             parts.append('<table border="0" cellspacing="0" cellpadding="2">')
             for k, v in node['attrs'].items():
@@ -545,14 +571,22 @@ class ManagerPanel(QMainWindow):
         self._sync_kg_buttons()
 
     def _kg_fill_relations(self, key):
-        """把当前实体有向关系填进列表：出边显示「关系 → 对端」，入边显示「对端 → 关系」。"""
+        """把当前实体有向关系填进列表：出边显示「关系 → 对端」，入边显示「对端 → 关系」。
+
+        有权重的关系在末尾标出权重（``· 8``），默认权重不标——否则整屏都是
+        重复的「· 1.0」，真正带权的那几条反而被淹掉。
+        """
         self.kg_rel_list.blockSignals(True)
         self.kg_rel_list.clear()
         self._kg_rel_edges = []
-        for rel, other, direction in self.kg.edges_of(key):
+        for rel, other, direction, weight, cn in self.kg.edges_of_detailed(key):
             o_type = NODE_TYPES.get(other[0], (other[0],))[0]
             arrow = '→' if direction == 'out' else '←'
-            self.kg_rel_list.addItem(f'{rel_cn(rel)} {arrow} {other[1]}  [{o_type}]')
+            label = other[1] + (f'（{cn}）' if cn else '')
+            w_mark = '' if weight == DEFAULT_WEIGHT else \
+                f'  · {int(weight) if float(weight).is_integer() else weight}'
+            self.kg_rel_list.addItem(
+                f'{rel_cn(rel)} {arrow} {label}  [{o_type}]{w_mark}')
             self._kg_rel_edges.append((rel, other, direction))
         self.kg_rel_list.blockSignals(False)
         if not self._kg_rel_edges:
@@ -586,9 +620,10 @@ class ManagerPanel(QMainWindow):
         return None
 
     def _kg_after_change(self, keep_key=None, keep_edge=None):
-        """编辑/导入后统一刷新：索引、自动补全、状态、画布与详情。"""
+        """编辑/导入后统一刷新：索引、自动补全、状态、图例、画布与详情。"""
         self._kg_refresh_completer()
         self._kg_update_status()
+        self._kg_refresh_legend()
         key = keep_key or self._kg_current
         if key is not None and key not in self.kg.nodes:
             key = None
@@ -671,7 +706,7 @@ class ManagerPanel(QMainWindow):
                              exclude=[anchor] if anchor else (), parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        src, rel, dst = dlg.values()
+        src, rel, dst, weight = dlg.values()
         missing = [n for n, k in (('源', src), ('目标', dst)) if k is None]
         if missing or not rel:
             QMessageBox.warning(self, '信息不完整', '请填写关系名与两端实体。')
@@ -680,7 +715,7 @@ class ManagerPanel(QMainWindow):
             for key in (src, dst):
                 if key not in self.kg.nodes:      # 对话框允许直接输入新实体名
                     self.kg.add_node(key[0], key[1], {}, overwrite=False)
-            created = self.kg.add_edge(src, rel, dst, overwrite=False)
+            created = self.kg.add_edge(src, rel, dst, overwrite=False, weight=weight)
         except (ValueError, KeyError) as e:
             QMessageBox.warning(self, '新增失败', str(e).strip("'"))
             return
@@ -700,7 +735,7 @@ class ManagerPanel(QMainWindow):
         dlg = EdgeEditDialog(self.kg, edge=edge, anchor=anchor, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        src, new_rel, dst = dlg.values()
+        src, new_rel, dst, weight = dlg.values()
         missing = [n for n, k in (('源', src), ('目标', dst)) if k is None]
         if missing or not new_rel:
             QMessageBox.warning(self, '信息不完整', '请填写关系名与两端实体。')
@@ -709,7 +744,7 @@ class ManagerPanel(QMainWindow):
             for key in (src, dst):
                 if key not in self.kg.nodes:
                     self.kg.add_node(key[0], key[1], {}, overwrite=False)
-            self.kg.update_edge(edge, (src, new_rel, dst))
+            self.kg.update_edge(edge, (src, new_rel, dst), weight=weight)
         except (ValueError, KeyError) as e:
             QMessageBox.warning(self, '保存失败', str(e).strip("'"))
             return
@@ -747,7 +782,9 @@ class ManagerPanel(QMainWindow):
         box.setText('请选择要导入的内容：')
         box.setInformativeText(
             '• CSV 目录：含 label-*.csv 与 rel-*.csv，是知识图谱的完整原始布局\n'
-            '• 单个 CSV：只导入一张表（实体表或关系表），用于补充零散数据')
+            '• 单个 CSV：只导入一张表（实体表或关系表），用于补充零散数据\n\n'
+            '关系表可带 weight 列（边权重，导入后以粗细与深浅呈现）；'
+            'label-*.csv 的类型取自文件名，未登记的类型会自动新增。')
         dir_btn = box.addButton('CSV 目录…', QMessageBox.ButtonRole.AcceptRole)
         file_btn = box.addButton('单个 CSV 文件…', QMessageBox.ButtonRole.AcceptRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
@@ -798,8 +835,13 @@ class ManagerPanel(QMainWindow):
         self._kg_after_change()
         msg = (f'实体：新增 {report["nodes_added"]}，更新 {report["nodes_updated"]}\n'
                f'关系：新增 {report["edges_added"]}，跳过 {report["edges_skipped"]}')
+        if report.get('edges_weighted'):
+            msg += f'（其中带权重 {report["edges_weighted"]} 条）'
         if report['stubs']:
             msg += f'\n自动补建实体 {report["stubs"]} 个'
+        if report.get('new_types'):
+            names = '、'.join(f'{cn}' for _key, cn in report['new_types'])
+            msg += f'\n自动新增实体类型 {len(report["new_types"])} 种：{names}'
         if report['ignored_files']:
             msg += f'\n忽略无法识别的文件：{", ".join(report["ignored_files"])}'
         QMessageBox.information(self, '导入完成', msg)
@@ -818,9 +860,12 @@ class ManagerPanel(QMainWindow):
         QMessageBox.information(
             self, '导出完成',
             f'实体表 {report["node_files"]} 个（{report["node_rows"]} 行）\n'
-            f'关系表 {report["edge_files"]} 个（{report["edge_rows"]} 行）\n\n'
-            f'已导出到：{report["dir"]}\n'
-            f'该目录可被「导入 CSV」整目录回灌。')
+            f'关系表 {report["edge_files"]} 个（{report["edge_rows"]} 行）\n'
+            + (f'其中带权重 {report["weighted_rows"]} 条'
+               f'（分布在 {report["weighted_files"]} 个关系表）\n'
+               if report.get('weighted_rows') else '')
+            + f'\n已导出到：{report["dir"]}\n'
+            '该目录可被「导入 CSV」整目录回灌。')
 
     def _on_kg_reload(self):
         """重置单例并重新打开数据库，丢弃内存中的未落库改动。"""

@@ -173,6 +173,57 @@ def main():
     print('回灌导入:', rep['nodes_added'], '实体 /', rep['edges_added'], '关系')
     assert rep['edges_added'] == report['edge_rows']
 
+    # ---- 新增能力：带权重的边 + 未登记类型（data/csv-edu）----
+    edu_dir = os.path.join(ROOT, 'data', 'csv-edu')
+    if os.path.isdir(edu_dir):
+        edu_rep = real_store.import_csv(edu_dir, replace=True)
+        print('edu 导入:', edu_rep['nodes_added'], '实体 /', edu_rep['edges_added'],
+              '关系 / 带权重', edu_rep['edges_weighted'],
+              '/ 新类型', [cn for _k, cn in edu_rep['new_types']])
+        # 早期版本这里是 0 实体 / 681 关系全跳过
+        assert edu_rep['nodes_added'] > 500
+        assert edu_rep['edges_skipped'] == 0
+        assert edu_rep['edges_weighted'] == edu_rep['edges_added']
+
+        # 图例应随新类型重建
+        panel._kg_after_change()
+        legend = panel.kg_legend.text()
+        assert 'AI' in legend or 'ai' in legend, legend
+
+        # 按中文名定位（实体名是英文）
+        panel.kg_search.setText('大语言模型')
+        panel._on_kg_search()
+        print('中文名搜索定位:', panel._kg_current)
+        assert panel._kg_current is not None
+        assert '大语言模型' in panel.kg_detail.toPlainText()
+
+        # 关系列表应显示权重
+        rel_texts = [panel.kg_rel_list.item(i).text()
+                     for i in range(panel.kg_rel_list.count())]
+        assert any('·' in t for t in rel_texts), rel_texts[:5]
+        print('带权重关系条目示例:', next(t for t in rel_texts if '·' in t))
+
+        # 画布已按权重重绘
+        assert panel.kg_canvas.center_key == panel._kg_current
+
+        # 带权重图谱的导出 → 回灌往返
+        edu_out = os.path.join(workdir, 'exported_edu')
+        edu_report = real_store.export_csv(edu_out)
+        print('edu 导出:', edu_report['node_files'], '实体表 /',
+              edu_report['edge_files'], '关系表 / 带权重文件',
+              edu_report['weighted_files'])
+        assert edu_report['weighted_files'] == edu_report['edge_files']
+        again = real_store.import_csv(edu_out, replace=True)
+        assert again['nodes_added'] == edu_report['node_rows']
+        assert again['edges_added'] == edu_report['edge_rows']
+        assert again['edges_skipped'] == 0
+        print('edu 往返: 权重保留',
+              real_store.edge_weight(('ai', 'instruction tuning'),
+                                     'derived_from',
+                                     ('ai', 'foundation model')))
+    else:
+        print('（无 data/csv-edu，跳过带权重边冒烟）')
+
     panel.deleteLater()
     real_store.close()
     print('\nSMOKE OK')
