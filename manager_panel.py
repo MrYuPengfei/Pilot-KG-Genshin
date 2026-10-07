@@ -37,7 +37,7 @@ from kg_store import (NODE_TYPES, get_default_store, reset_default_store,
 from kg_editor import NodeEditDialog, EdgeEditDialog
 from kg_view import KGCanvas
 
-APP_VERSION = '3.8'
+APP_VERSION = '3.8.2'
 REPO_URL = 'https://github.com/MrYuPengfei/Pilot-KG-Genshin.git'
 
 # 全局按钮尺寸：管理面板**所有页**的按钮一律用这个尺寸，保证视觉一致。
@@ -982,6 +982,15 @@ class ManagerPanel(QMainWindow):
         item = self.role_list.currentItem()
         return item.text() if item else None
 
+    def _selected_area(self):
+        """音乐管理页左侧选中的地区名；未选中返回 None。
+
+        播放、删除、导出三处都读这个列表，故统一走本方法——
+        各自去碰 ``area_list.currentItem()`` 会在列表为空时漏判。
+        """
+        item = self.area_list.currentItem()
+        return item.text() if item else None
+
     def _apply_role_settings(self):
         role = self._selected_role()
         if not role:
@@ -1039,7 +1048,13 @@ class ManagerPanel(QMainWindow):
         self.play_bgm_btn.clicked.connect(self._play_selected_area)
         self.stop_bgm_btn = QPushButton('停止背景音乐')
         self.stop_bgm_btn.clicked.connect(self._stop_bgm)
-        for btn in (self.play_bgm_btn, self.stop_bgm_btn):
+        # v3.8.2：删除选中地区的背景音乐。放在「背景音乐」分组内而非人物页，
+        # 因为它操作的对象就是左侧地区列表里的那一项。
+        self.delete_bgm_btn = QPushButton('删除选中背景音乐')
+        self.delete_bgm_btn.setToolTip(
+            '从资源库中删除选中地区的背景音乐（不可恢复）')
+        self.delete_bgm_btn.clicked.connect(self._delete_area_bgm)
+        for btn in (self.play_bgm_btn, self.stop_bgm_btn, self.delete_bgm_btn):
             btn.setFixedSize(BTN_W, BTN_H)
             bgm_row.addWidget(btn)
         bgm_row.addStretch(1)
@@ -1065,15 +1080,70 @@ class ManagerPanel(QMainWindow):
         self.tabs.addTab(tab, '音乐管理')
 
     def _play_selected_area(self):
-        item = self.area_list.currentItem()
-        if not item:
+        area = self._selected_area()
+        if not area:
             return
-        self.pilot.play_area_bgm(item.text())
+        self.pilot.play_area_bgm(area)
         self._refresh_music_state()
 
     def _stop_bgm(self):
         self.pilot.stop_bgm()
         self._refresh_music_state()
+
+    def _delete_area_bgm(self):
+        """删除选中地区的背景音乐（v3.8.2）。
+
+        三个必须处理的细节：
+
+        1. **正在播放的必须先停**。``mixer.music`` 还拿着这条流的缓冲区，
+           删完库之后它仍会循环播到自然结束，用户会以为没删掉；
+           且 ``config['bg_music']`` 得清掉，否则菜单里会留下一个指向
+           已不存在地区的「～」标记，重启时还会尝试读取并抛 FileNotFoundError。
+        2. **只删 BGM，不动人物**。地区名与角色名**共用 assets 表的 role 一列**，
+           真正把它们区分开的是 kind 字段；``delete_area`` 精确限定 ``kind='bgm'``，
+           所以不会误删同名人物的帧与语音（测试里有这条断言）。
+        3. **filesystem 后端要明确报错**。该后端删不掉（会抛 RuntimeError），
+           此时必须提示而不是静默失败。
+        """
+        area = self._selected_area()
+        if not area:
+            QMessageBox.information(
+                self, '请先选择', '请在左侧地区列表中选中要删除的背景音乐。')
+            return
+        ret = QMessageBox.question(
+            self, '确认删除',
+            f'确定删除「{area}」的背景音乐吗？\n'
+            '该资源将从资源库中移除，此操作不可恢复。'
+            + ('\n\n该地区正在播放，删除后会停止播放。'
+               if self.config.get('bg_music') == area else ''))
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        # 确认后才停播：正在播放的必须先停。mixer.music 还拿着这条流的缓冲区，
+        # 删完库它仍会循环播到自然结束，用户会以为没删掉；
+        # 且 config['bg_music'] 得清掉，否则菜单里会留下指向已不存在地区的
+        # 「～」标记，重启时还会尝试读取并抛 FileNotFoundError。
+        if self.config.get('bg_music') == area:
+            self.pilot.stop_bgm()
+            self.config['bg_music'] = False
+            self.pilot.save_config()
+
+        try:
+            removed = self.store.delete_area(area)
+        except Exception as e:
+            # filesystem 后端删不掉，会抛 RuntimeError
+            QMessageBox.warning(self, '无法删除', str(e))
+            return
+        if not removed:
+            QMessageBox.information(
+                self, '未找到', f'资源库中已没有「{area}」的背景音乐。')
+        else:
+            QMessageBox.information(
+                self, '已删除', f'已删除「{area}」的背景音乐。')
+        # 菜单里的地区项随资源库动态生成，删完必须重建，否则仍能点到一个空地区
+        self.pilot._rebuild_bgm_menu()
+        self.pilot.save_config()
+        self.refresh()
 
     def _mute_all(self):
         self.pilot.set_voice_enabled(False)
@@ -1135,7 +1205,13 @@ class ManagerPanel(QMainWindow):
         self.export_scope_combo = QComboBox()
         self.export_scope_combo.addItem('全部素材', None)
         self.export_scope_combo.addItem('仅当前人物', 'current')
-        self.export_scope_combo.setToolTip('「仅当前人物」只导出该角色的帧与语音，不含地区背景音乐')
+        # v3.8.2：只导选中地区的背景音乐。BGM 在资源库里是独立的一类资源
+        # （靠 kind 字段与人物区分），全量导出时只是顺带捎上；
+        # 单独一项是为了能只取一段音乐去分享 / 备份。
+        self.export_scope_combo.addItem('仅当前背景音乐', 'current_bgm')
+        self.export_scope_combo.setToolTip(
+            '「仅当前人物」只导出该角色的帧与语音，不含地区背景音乐\n'
+            '「仅当前背景音乐」只导出音乐管理页选中的那个地区的背景音乐')
         self.export_scope_combo.setFixedSize(BTN_W, BTN_H)
         export_dir_btn = QPushButton('导出为目录')
         export_dir_btn.setToolTip('写出 png/<角色>、music/<角色>、music/<地区> 目录树')
@@ -1225,9 +1301,24 @@ class ManagerPanel(QMainWindow):
             # 「仅当前人物」只导该人物，不导地区背景音乐——它们与人物无关，
             # 全量带上会平白多出几 MB 且与选项名不符。
             areas = []
+        elif scope == 'current_bgm':
+            # 「仅当前背景音乐」只导音乐管理页选中的地区：
+            # roles=[] 排除全部人物帧与语音，areas=[选中地区] 只保留这一段音乐。
+            area = self._selected_area()
+            if not area:
+                QMessageBox.information(
+                    self, '请先选择地区',
+                    '「仅当前背景音乐」需要先在「音乐管理」页选中一个地区。')
+                return
+            roles, areas = [], [area]
+            # 导出物只剩一段音乐，沿用「桌面伙伴素材」这个名字会让人以为
+            # 拿到了全量素材，故按范围取名。
+            name_hint = f'{area}背景音乐'
+        else:
+            name_hint = '桌面伙伴素材'
 
         if as_zip:
-            default = '桌面伙伴素材.zip'
+            default = f'{name_hint}.zip'
             path, _ = QFileDialog.getSaveFileName(
                 self, '导出素材为 zip', default, 'Zip 压缩包 (*.zip)')
             if not path:
@@ -1237,7 +1328,7 @@ class ManagerPanel(QMainWindow):
             out_dir = QFileDialog.getExistingDirectory(self, '选择导出目录')
             if not out_dir:
                 return
-            out_path = os.path.join(out_dir, '桌面伙伴素材')
+            out_path = os.path.join(out_dir, name_hint)
 
         dlg = QProgressDialog('正在导出素材…', '取消', 0, 100, self)
         dlg.setWindowTitle('导出素材')
@@ -1263,12 +1354,17 @@ class ManagerPanel(QMainWindow):
             dlg.close()
 
         size = _human_size(report['bytes'])
+        # 结尾那句「可用导入素材并入」只对含人物资源的导出成立：
+        # 纯 BGM 包没有人物帧，导入器的「只补缺失人物」流程用不上，如实说明。
+        tail = ('导出结果符合素材包格式，可用「导入素材」直接并入。'
+                if report['roles'] else
+                '本次只导出了背景音乐（不含人物素材），可单独保存或分享。')
         QMessageBox.information(
             self, '导出完成',
             f'文件 {report["files"]} 个（{size}）\n'
             f'人物 {report["roles"]} 个 · 地区 {report["areas"]} 个\n\n'
             f'已导出到：{report["path"]}\n\n'
-            f'导出结果符合素材包格式，可用「导入素材」直接并入。')
+            f'{tail}')
 
     def _export_config(self, fmt='json'):
         """导出配置到用户选择的路径（v3.8 起只有 JSON）。

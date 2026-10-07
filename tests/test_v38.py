@@ -193,13 +193,22 @@ def test_app_icon_prefers_disk_file():
 def test_version_three_places_match():
     """版本号三处必须一致：面板常量 / setup.iss / pyproject.toml。
 
-    漏改任何一处都会导致「关于里显示 3.8、安装器还是 3.7」这种低级问题。
+    漏改任何一处都会导致「关于里显示 3.8.2、安装器还是 3.8」这种低级问题。
+
+    ⚠️ 比较方式必须同时兼容**两段式**（APP_VERSION='3.8' ↔ pyproject='3.8.0'）
+    与**三段式**（APP_VERSION='3.8.2' ↔ pyproject='3.8.2'）：
+
+    - 早先只写 ``pkg_version.startswith(f'{APP_VERSION}.')``，那是按「面板号是
+      省略第三段的前缀」写的；升到 3.8.2 后 pyproject 恰是 ``'3.8.2'``，
+      ``'3.8.2'.startswith('3.8.2.')`` 为假 → 三处**其实完全一致**却报失败。
+    - 也不能改成纯字符串相等：3.8 ↔ 3.8.0 那样是合法的两段/三段写法。
+    故取「相等」或「补一段后相等」两者皆可。
     """
     import tomllib
 
     with open(os.path.join(ROOT, 'pyproject.toml'), 'rb') as f:
         pkg_version = tomllib.load(f)['project']['version']
-    assert pkg_version.startswith(f'{APP_VERSION}.'), \
+    assert pkg_version in (APP_VERSION, f'{APP_VERSION}.0'), \
         f'pyproject {pkg_version} 与 APP_VERSION {APP_VERSION} 不一致'
 
     iss = open(os.path.join(ROOT, 'setup.iss'), encoding='utf-8').read()

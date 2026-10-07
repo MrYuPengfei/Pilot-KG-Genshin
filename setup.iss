@@ -38,7 +38,7 @@
 ; =============================================================
 
 #define AppName "原神桌面伙伴"
-#define AppVersion "3.8"
+#define AppVersion "3.8.2"
 #define AppPublisher "于鹏飞"
 #define AppURL "https://github.com/MrYuPengfei/Pilot-KG-Genshin"
 #define AppExeName "原神桌面伙伴.exe"
