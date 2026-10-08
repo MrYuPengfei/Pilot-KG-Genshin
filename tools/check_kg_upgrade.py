@@ -10,7 +10,7 @@ import sys
 
 INSTALL_DIR = sys.argv[1]
 KG = os.path.join(INSTALL_DIR, '_internal', 'kg.db')
-INSTALLER = r'D:\VMwareShareFolder\project\Pilot\inno_build\原神桌面伙伴安装向导.exe'
+INSTALLER = r'D:\VMwareShareFolder\project\Pilot\inno_build\桌面伙伴-Pilot安装向导.exe'
 MARK = '升级保留测试实体'
 
 

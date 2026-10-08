@@ -16,8 +16,8 @@ import os
 
 import pytest
 
-from kg_store import (KGStore, DEFAULT_WEIGHT, CN_NAME_KEY, register_type,
-                      rel_cn, type_cn)
+from kg_store import (KGStore, DEFAULT_WEIGHT, CN_NAME_KEY, EN_NAME_KEY,
+                      register_type, rel_cn, type_cn)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EDU_DIR = os.path.join(ROOT, 'data', 'csv-edu')
@@ -133,17 +133,18 @@ def test_new_types_registered(edu):
     assert register_type('ai') == before
 
 
-def test_label_column_cn_name_kept(edu):
-    """``label`` 列在 csv-edu 里是**中文名**而非类型键，须单独保存。
+def test_name_cn_column_kept(edu):
+    """统一表头后``name_cn`` 是中文名、``name`` 是主键（英文名）。
 
-    若误当成类型键，「大规模基础模型」会被注册成一个节点类型，
-    实体则因类型为空被整行丢弃。
+    早期版本里csv-edu 的 ``label`` 列装的是中文名，且要靠
+    「像不像类型键」来猜——统一表头后语义明确，不再需要猜。
     """
     key = ('ai', 'foundation model')
     assert key in edu.nodes
     assert edu.node_cn_name(key) == '大规模基础模型'
-    # 中文名不得污染属性表：它是展示位，不是业务属性
-    assert edu.node_attrs(key).get('category') == 'AI领域'
+    assert edu.node_en_name(key) == 'foundation model'
+    # 类型中文名（原category/label_cn 列）不得污染成实体属性：它是类型级信息
+    assert edu.node_attrs(key).get('label_cn') is None
 
 
 def test_search_finds_by_chinese_name(edu):
@@ -263,15 +264,19 @@ def test_export_writes_weight_column(edu, tmp_path):
         f'整数权重不应写成小数：{sorted(weights)[:5]}'
 
 
-def test_export_label_column_holds_cn_name(edu, tmp_path):
-    """实体表 label 列写中文名（csv-edu 形态），无中文名时写类型键（原神形态）。"""
+def test_export_writes_unified_columns(edu, tmp_path):
+    """导出用统一表头：name(英文) / name_cn(中文) / label(类型键)。"""
     out = str(tmp_path / 'edu_out3')
     edu.export_csv(out)
     with open(os.path.join(out, 'label-ai.csv'), encoding='utf-8-sig') as f:
-        rows = {r['name']: r for r in csv.DictReader(f)}
-    assert rows['foundation model']['label'] == '大规模基础模型'
-    # 中文名不应同时占一列（否则往返会重复）
-    assert CN_NAME_KEY not in rows['foundation model']
+        rows = {r['name_cn']: r for r in csv.DictReader(f)}
+    row = rows['大规模基础模型']
+    assert row['name'] == 'foundation model'   # 英文名
+    assert row['label'] == 'ai'                # 类型键，不再装中文名
+    # 中文名只出现在 name_cn 一列，不该再有第二个「中文名列」
+    # （CN_NAME_KEY 即'name_cn'，与 CSV 列名对齐）
+    assert CN_NAME_KEY == 'name_cn'
+    assert EN_NAME_KEY not in row
 
 
 def test_genshin_export_unchanged(tmp_path):
@@ -289,8 +294,11 @@ def test_genshin_export_unchanged(tmp_path):
         header = f.readline().strip()
     assert header == 'node1,rel,node2'
     with open(os.path.join(out, 'label-character.csv'), encoding='utf-8-sig') as f:
-        row = next(csv.DictReader(f))
-    assert row['label'] == 'character'
+        rows = list(csv.DictReader(f))
+    # ⚠️ 别假设行序：导出按实体名排序
+    assert all(r['label'] == 'character' for r in rows)
+    assert all(r['name_cn'] for r in rows), '中文名应在name_cn 列'
+    assert {'name_cn', 'label'} <= set(rows[0])
 
 
 # ---------- 渲染：权重与中文名 ----------

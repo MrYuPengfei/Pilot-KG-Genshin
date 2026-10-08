@@ -1,6 +1,6 @@
 """打包产物校验：确认安装包只含三个 .db、help.html 与图标，不含任何 CSV / JSON 配置。
 
-配合 `原神桌面伙伴.spec` + `setup.iss` 使用。在**构建完成后**运行：
+配合 `桌面伙伴-Pilot.spec` + `setup.iss` 使用。在**构建完成后**运行：
 
     uv run python tools/verify_package.py
 
@@ -18,9 +18,9 @@ import sqlite3
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DIST = os.path.join(ROOT, 'dist', '原神桌面伙伴')
+DIST = os.path.join(ROOT, 'dist', '桌面伙伴-Pilot')
 INTERNAL = os.path.join(DIST, '_internal')
-BUILD = os.path.join(ROOT, 'build', '原神桌面伙伴')
+BUILD = os.path.join(ROOT, 'build', '桌面伙伴-Pilot')
 
 # 三个库的合理下限（字节），低于此值视为空库或半成品
 MIN_SIZES = {'assets.db': 400 * 1024 * 1024,
@@ -44,8 +44,8 @@ def main():
     print('校验打包产物：安装包应只含三个 .db、help.html 与图标，不含 CSV / JSON\n')
 
     print('① 目录结构')
-    check(os.path.isfile(os.path.join(DIST, '原神桌面伙伴.exe')),
-          'exe 位于产物根目录', os.path.join(DIST, '原神桌面伙伴.exe'))
+    check(os.path.isfile(os.path.join(DIST, '桌面伙伴-Pilot.exe')),
+          'exe 位于产物根目录', os.path.join(DIST, '桌面伙伴-Pilot.exe'))
     check(os.path.isdir(INTERNAL), '_internal 目录存在')
 
     print('\n② 三个数据库就位且非空')

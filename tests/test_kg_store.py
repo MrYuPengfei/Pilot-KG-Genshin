@@ -172,14 +172,18 @@ def test_find_and_neighbors(kg):
     neighbors = kg.neighbors(keys[0])
     rels = {rel for rel, _, _ in neighbors}
     assert {'element_is', 'come_from', 'weapon_is'} <= rels
-    targets = {other[1] for _, _, other in neighbors}
-    assert '蒙德' in targets and '岩' in targets
+    # 邻居名优先显示英文名（node_display），无译名的仍是中文
+    targets = {kg.node_display(other) for _, _, other in neighbors}
+    assert 'Mondstadt' in targets and '岩' in targets
 
 
 def test_rel_direction_resolved(kg):
     """rel-country-area.csv 实际方向是 地区→国家，两端类型须正确解析。"""
     assert ('area', '鹤观') in kg.find('鹤观')
-    assert any(rel == 'part_of' and other == ('country', '稻妻')
+    # country 有官方译名，主键是英文（Inazuma），中文名要用 find 换算
+    inazuma = ('country', 'Inazuma')
+    assert kg.find('稻妻') == [inazuma]
+    assert any(rel == 'part_of' and other == inazuma
                for rel, _, other in kg.neighbors(('area', '鹤观')))
 
 
@@ -204,9 +208,11 @@ def test_search(kg):
 
 
 def test_ego_network(kg):
+    # 主键是英文名（country 有官方译名），中文名要用 find 换算
+    liyue = kg.find('璃月')[0]
     nodes, edges = kg.ego_network(('character', '钟离'), hops=1)
     assert ('character', '钟离') in nodes
-    assert ('country', '璃月') in nodes
+    assert liyue in nodes
     expected = {('character', '钟离')} | {o for _, _, o in kg.neighbors(('character', '钟离'))}
     assert nodes == expected
     for k1, rel, k2 in edges:
@@ -355,8 +361,8 @@ def test_export_then_reimport_roundtrip(kg, tmp_path):
     assert rep['edges_added'] == report['edge_rows']
     assert clone.stats()['nodes'] == kg.stats()['nodes']
     assert clone.stats()['edges'] == kg.stats()['edges']
-    # 关键关系在往返后保持
-    assert any(rel == 'part_of' and other == ('country', '稻妻')
+    # 关键关系在往返后保持（country 主键是英文名 Inazuma）
+    assert any(rel == 'part_of' and other == ('country', 'Inazuma')
                for rel, _, other in clone.neighbors(('area', '鹤观')))
     clone.close()
 
@@ -368,7 +374,11 @@ def test_export_edge_direction_in_filename(kg, tmp_path):
     assert os.path.isfile(os.path.join(out, 'rel-area-country.csv'))
     with open(os.path.join(out, 'rel-area-country.csv'), encoding='utf-8-sig') as f:
         rows = list(csv.DictReader(f))
-    assert any(r['node1'] == '鹤观' and r['node2'] == '稻妻' for r in rows)
+    # 端点写的是**主键**。area 无官方译名 → 主键是中文「鹤观」；
+    # country 有译名 → 主键是英文「Inazuma」。源数据里两者都是中文名，
+    # 这是统一表头后的预期差异（导出目录内部自洽，可整目录回灌）。
+    assert any(r['node1'] == '鹤观' and r['node2'] == 'Inazuma' for r in rows), \
+        '关系端点应写主键（country 用英文名）'
 
 
 def test_import_single_rel_file(empty_kg, tmp_path):

@@ -18,10 +18,11 @@ import os
 
 import pytest
 
-from kg_store import KGStore, DEFAULT_WEIGHT, REL_NAMES, rel_cn
+from kg_store import KGStore, DEFAULT_WEIGHT, EN_NAME_KEY, REL_NAMES, rel_cn
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EDU_DIR = os.path.join(ROOT, 'data', 'csv-edu')
+GENSHIN_DIR = os.path.join(ROOT, 'data', 'csv')
 
 pytestmark = pytest.mark.skipif(
     not os.path.isdir(EDU_DIR),
@@ -162,6 +163,55 @@ def test_export_writes_rel_cn_and_roundtrips(edu, tmp_path):
     assert clone.rel_cn_of('contrast_with') == '与……对比'
     assert clone.stats()['nodes'] == edu.stats()['nodes']
     assert clone.stats()['edges'] == edu.stats()['edges']
+
+
+def test_export_keeps_english_name_as_primary_key(tmp_path):
+    """回归：英文名恰好等于主键时，导出**不能**把它丢掉。
+
+    这条盯的是真丢过的数据：``country`` 的英文名（Liyue/璃月）就是主键，
+    而英文名等于主键时**不存成属性**（避免与主键重复）。若导出时只查
+    属性判断「有没有英文名」，就会误判为无、导出时把英文名列省掉——
+    回灌后中文名变成主键，同一个国家裂成两个节点（实测 1910→1915）。
+    """
+    d = tmp_path / 'd'
+    d.mkdir()
+    (d / 'label-country.csv').write_text(
+        'name,name_cn,label,label_cn\nLiyue,璃月,country,国家\n',
+        encoding='utf-8')
+    store = KGStore(str(tmp_path / 'kg.db'), auto_seed=False)
+    store.import_csv(str(d), replace=True)
+    # 英文名等于主键 → 属性里没有，但 node_en_name 要能算出来
+    key = ('country', 'Liyue')
+    assert store.node_en_name(key) == 'Liyue'
+    assert EN_NAME_KEY not in store.node_attrs(key)
+
+    out = str(tmp_path / 'out')
+    store.export_csv(out)
+    with open(os.path.join(out, 'label-country.csv'), encoding='utf-8-sig') as f:
+        row = next(csv.DictReader(f))
+    assert row['name'] == 'Liyue' and row['name_cn'] == '璃月'
+
+    # 往返后仍是同一个节点，不裂成两个
+    clone = KGStore(str(tmp_path / 'clone.db'), auto_seed=False)
+    clone.import_csv(out, replace=True)
+    assert ('country', 'Liyue') in clone.nodes
+    assert ('country', '璃月') not in clone.nodes
+    assert clone.stats()['nodes'] == 1
+
+
+def test_roundtrip_preserves_node_count_both_datasets(tmp_path):
+    """两套数据导出再回灌，节点/关系数必须一模一样。"""
+    for tag, src in (('genshin', GENSHIN_DIR), ('edu', EDU_DIR)):
+        if not os.path.isdir(src):
+            pytest.skip(f'缺少 {src}')
+        store = KGStore(str(tmp_path / f'{tag}.db'), auto_seed=False)
+        store.import_csv(src, replace=True)
+        out = str(tmp_path / f'{tag}_out')
+        store.export_csv(out)
+        clone = KGStore(str(tmp_path / f'{tag}_c.db'), auto_seed=False)
+        clone.import_csv(out, replace=True)
+        assert clone.stats()['nodes'] == store.stats()['nodes'], tag
+        assert clone.stats()['edges'] == store.stats()['edges'], tag
 
 
 def test_genshin_export_has_no_rel_cn_column(tmp_path):
@@ -327,6 +377,38 @@ def test_canvas_renders_bilingual_labels(edu, app):
                    if isinstance(i, QGraphicsTextItem) and i.parentItem() is None]
     assert any('衍生自' in t and 'derived_from' in t for t in edge_labels), \
         f'边标签应同时含中英关系名，实际：{edge_labels}'
+
+
+def test_label_not_duplicated_when_cn_equals_key(app):
+    """回归：中文名与主键相同时，标签/提示**不得**重复显示两遍。
+
+    原神实体暂无官方英文名，主键就是中文名（如「阿贝多」），而
+    ``node_cn_name`` 会回退返回主键——两者相同却都渲染出来时，
+    标签就成了「阿贝多 / 阿贝多」两行重复。
+    """
+    from kg_view import NodeItem, node_label_html
+
+    from PySide6.QtGui import QTextDocument
+    text = QTextDocument()
+    text.setHtml(node_label_html('阿贝多', '阿贝多'))
+    assert text.toPlainText().strip() == '阿贝多'
+
+    from PySide6.QtWidgets import QGraphicsScene
+    scene = QGraphicsScene()
+    canvas = _FakeCanvas()
+    item = NodeItem(('character', '阿贝多'), 15, canvas, '阿贝多')
+    scene.addItem(item)
+    assert item.label.toPlainText().strip() == '阿贝多'
+    assert item.toolTip().count('阿贝多') == 1
+
+
+class _FakeCanvas:
+    """NodeItem 只需要一个带 nodeSelected/nodeExpanded 信号的画布。"""
+
+    def __init__(self):
+        from PySide6.QtCore import Signal
+        self.nodeSelected = Signal(object)
+        self.nodeExpanded = Signal(object)
 
 
 def test_dense_ego_labels_do_not_overlap(edu, app):

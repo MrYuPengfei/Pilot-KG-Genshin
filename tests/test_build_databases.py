@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from config_store import ConfigStore, DEFAULTS   # noqa: E402
-from kg_store import KGStore, SCHEMA_VERSION as KG_SCHEMA   # noqa: E402
+from kg_store import KGStore, SCHEMA_VERSION as KG_SCHEMA, type_cn  # noqa: E402
 
 # 以文件方式加载构建工具：它是发布脚本而非库，import tools.build_databases
 # 会在导入期就绑定 ROOT 常量，不利于测试用临时目录。
@@ -49,8 +49,14 @@ def workspace(tmp_path, monkeypatch):
         'frame_scale': {'甲': [70, 1.4], '乙': [60, 0.8]},
     }, ensure_ascii=False), encoding='utf-8')
 
+    # 第二套图谱（v3.8.3 起一并构建）。默认**不存在**，让本fixture 的
+    # 「4 个节点」预期保持成立；需要验证 edu 合并的用例自己造一份再指过来。
+    # ⚠️ 必须显式指向临时目录：否则build_kg 会读到仓库里真实的
+    # data/csv-edu（732 个实体），把这里的断言全部带崩。
     monkeypatch.setattr(build_databases, 'ROOT', str(tmp_path))
     monkeypatch.setattr(build_databases, 'CSV_DIR', str(csv_dir))
+    monkeypatch.setattr(build_databases, 'CSV_DIR_EDU',
+                        str(tmp_path / 'data' / 'csv-edu'))
     monkeypatch.setattr(build_databases, 'SEED_JSON', str(seed))
     monkeypatch.setattr(build_databases, 'KG_DB', str(tmp_path / 'kg.db'))
     monkeypatch.setattr(build_databases, 'CONFIG_DB', str(tmp_path / 'config.db'))
@@ -161,6 +167,45 @@ def test_build_all(workspace):
     assert (workspace / 'kg.db').is_file()
     assert (workspace / 'config.db').is_file()
     assert set(results) == {'kg', 'config'}
+
+
+def test_build_kg_merges_both_csv_dirs(workspace, monkeypatch):
+    """v3.8.3：kg.db 应同时含原神与 edu 两套图谱。
+
+    两套数据合并进**同一个**库，面板里两类实体共存、可互相检索；
+    且 edu 的新类型（ai / education / database）要自动注册出中文名与配色。
+    """
+    edu_dir = workspace / 'data' / 'csv-edu'
+    edu_dir.mkdir(parents=True)
+    (edu_dir / 'label-ai.csv').write_text(
+        'name,name_cn,label,label_cn\n'
+        'foundation model,大规模基础模型,ai,AI领域\n'
+        'large language model,大语言模型,ai,AI领域\n', encoding='utf-8')
+    (edu_dir / 'rel-ai-ai.csv').write_text(
+        'node1,rel,rel_cn,node2,weight\n'
+        'large language model,derived_from,衍生自,foundation model,8\n',
+        encoding='utf-8')
+    monkeypatch.setattr(build_databases, 'CSV_DIR_EDU', str(edu_dir))
+
+    res = build_databases.build_kg(verbose=False)
+    assert res['csv_files'] == 3
+    assert res['edu_csv_files'] == 2      # label-ai.csv + rel-ai-ai.csv
+    assert res['edu']['nodes_added'] == 2
+    assert res['edu']['edges_added'] == 1
+    assert res['edu']['rel_cn_added'] == 1
+
+    store = KGStore(str(workspace / 'kg.db'), auto_seed=False)
+    try:
+        # 两套数据共存
+        assert ('character', '甲') in store.nodes
+        assert ('ai', 'foundation model') in store.nodes
+        # edu 的关系连上了，且关系中文名已登记
+        assert store.rel_cn_of('derived_from') == '衍生自'
+        # 新类型有中文名（否则画布上是灰点、图例显示生类型键）
+        assert type_cn('ai') == 'AI领域'
+        assert store.info()['built_from'] == 'data/csv + data/csv-edu'
+    finally:
+        store.close()
 
 
 def test_check_mode_writes_nothing(workspace):

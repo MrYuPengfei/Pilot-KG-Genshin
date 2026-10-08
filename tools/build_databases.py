@@ -37,6 +37,9 @@ from config_store import ConfigStore                # noqa: E402
 from kg_store import KGStore                        # noqa: E402
 
 CSV_DIR = os.path.join(ROOT, 'data', 'csv')
+# 第二套图谱：AI / 教育 / 数据库领域（v3.8.3 起一并入库）。
+# 与原神图谱合并进同一个 kg.db——面板里两类实体共存、可互相检索。
+CSV_DIR_EDU = os.path.join(ROOT, 'data', 'csv-edu')
 SEED_JSON = os.path.join(ROOT, 'data', 'config.json')
 KG_DB = os.path.join(ROOT, 'kg.db')
 CONFIG_DB = os.path.join(ROOT, 'config.db')
@@ -56,7 +59,7 @@ def _version():
 
 
 def build_kg(force=False, check_only=False, verbose=True, backup=True):
-    """由 data/csv 构建 kg.db。返回报告 dict。
+    """由 data/csv + data/csv-edu 一起构建 kg.db。返回报告 dict。
 
     ⚠️ **会丢弃程序里对图谱做的编辑**。知识图谱在运行时可由用户编辑
     （管理面板「知识图谱」页），而 CSV 只是当初的初始数据——两者并非同一份内容。
@@ -65,11 +68,18 @@ def build_kg(force=False, check_only=False, verbose=True, backup=True):
 
     日常打包其实**不需要**重建：kg.db 已随源码分发，直接构建即可
     （不加 ``--force`` 时本函数会跳过）。
+
+    两套 CSV 是**先后导入、同一事务外两次调用**：原神图谱先（提供主键与
+    12 种内置类型），edu 后（``ai`` / ``education`` / ``database`` 作为新类型
+    自动注册）。⚠️ 不能合成一次 ``import_csv([dir1, dir2])``——该方法只接受
+    单个路径，分两次导入也便于报告里分别给出两套数据各自的节点/关系数。
     """
     if not os.path.isdir(CSV_DIR):
         raise FileNotFoundError(
             f'知识图谱 CSV 目录不存在：{CSV_DIR}\n'
-            f'CSV 是构建输入，不随安装包分发。若要重建知识图谱库，请先备齐 27 个 CSV。')
+            f'CSV 是构建输入，不随安装包分发。若要重建知识图谱库，请先备齐 CSV。')
+
+    edu_present = os.path.isdir(CSV_DIR_EDU)
 
     if os.path.isfile(KG_DB) and not force and not check_only:
         store = KGStore(KG_DB, auto_seed=False)
@@ -83,15 +93,17 @@ def build_kg(force=False, check_only=False, verbose=True, backup=True):
         return report
 
     csv_count = len([f for f in os.listdir(CSV_DIR) if f.endswith('.csv')])
+    edu_count = (len([f for f in os.listdir(CSV_DIR_EDU) if f.endswith('.csv')])
+                 if edu_present else 0)
     if check_only:
         store = KGStore(KG_DB, auto_seed=False) if os.path.isfile(KG_DB) else None
-        report = {'csv_files': csv_count,
+        report = {'csv_files': csv_count, 'edu_csv_files': edu_count,
                   'nodes': len(store.nodes) if store else 0,
                   'edges': len(store._edges) if store else 0}
         if store:
             store.close()
         if verbose:
-            print(f'  [检查] CSV {csv_count} 个；kg.db '
+            print(f'  [检查] CSV 原神 {csv_count} 个 / edu {edu_count} 个；kg.db '
                   f'{"存在" if report["nodes"] else "不存在/为空"}'
                   f'（{report["nodes"]} 节点 / {report["edges"]} 关系）')
         return report
@@ -112,8 +124,19 @@ def build_kg(force=False, check_only=False, verbose=True, backup=True):
         os.remove(tmp_db)
     store = KGStore(tmp_db, auto_seed=False)
     try:
+        # 先原神（replace 清空），再 edu 合并进来
         report = store.import_csv(CSV_DIR, replace=True)
-        store.set_meta('built_from', 'data/csv')
+        edu_report = None
+        if edu_present:
+            edu_report = store.import_csv(CSV_DIR_EDU)
+            report['edu'] = {
+                'nodes_added': edu_report['nodes_added'],
+                'edges_added': edu_report['edges_added'],
+                'rel_cn_added': edu_report['rel_cn_added'],
+                'stubs': edu_report['stubs'],
+            }
+        built_from = 'data/csv + data/csv-edu' if edu_present else 'data/csv'
+        store.set_meta('built_from', built_from)
         store.set_meta('app_version', _version())
         store.close()
         os.replace(tmp_db, KG_DB)
@@ -125,11 +148,13 @@ def build_kg(force=False, check_only=False, verbose=True, backup=True):
 
     final = KGStore(KG_DB, auto_seed=False)
     result = {'path': KG_DB, 'nodes': len(final.nodes), 'edges': len(final._edges),
-              'csv_files': csv_count, 'backup': backup_path, **report}
+              'csv_files': csv_count, 'edu_csv_files': edu_count,
+              'backup': backup_path, **report}
     final.close()
     if verbose:
+        extra = f' + edu {edu_count} 个' if edu_present else ''
         print(f'  已生成 kg.db：{result["nodes"]} 节点 / {result["edges"]} 关系'
-              f'（{_human(os.path.getsize(KG_DB))}，来自 {csv_count} 个 CSV）')
+              f'（{_human(os.path.getsize(KG_DB))}，来自 {csv_count}{extra} CSV）')
     return result
 
 

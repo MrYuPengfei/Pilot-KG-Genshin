@@ -65,9 +65,16 @@ def _auto_color(index):
     return f'#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}'
 
 
-# 中文别名对应的属性键：csv-edu 的 label 列放的是中文名（"大规模基础模型"）
-# 而非类型键，故单独落到该键，导出时再写回 label 列，保证往返无损。
-CN_NAME_KEY = 'label_cn'
+# 实体中文名对应的属性键。⚠️ **不能叫 label_cn**——统一表头后CSV 里
+# ``label_cn`` 列是**类型**的中文名（``AI领域``），同名会把两个不同语义
+# 搅在一起（实测 edu 实体的中文名被写进 label_cn 属性，与类型名撞车）。
+# 用 ``name_cn`` 与 CSV 列名对齐，导出时写回该列，往返无损。
+CN_NAME_KEY = 'name_cn'
+
+# 英文名对应的属性键：实体表 ``name`` 列（**可为空**——原神实体的官方
+# 英文名待补，当前只有 country 有 7 个）。为空就不写该键，详情面板也不会
+# 多出一行空的「英文名」。
+EN_NAME_KEY = 'name_en'
 
 
 # 关系英文键 -> 中文名（用户自建关系不在此表中，显示时回退为原文）
@@ -141,15 +148,21 @@ _WEIGHT_COLS = ('weight', '权重', '权重值', 'strength', '置信度')
 _REL_CN_COLS = ('rel_cn', 'rel-cn', 'relcn', '关系', '关系名', '关系中文名')
 
 # 自动注册新类型时用来起中文名的列：取该列在本表内的**众数**。
-# csv-edu 的 label-ai.csv 里 category 多为「AI领域」、label-education.csv 多为
-# 「教育领域」，比直接显示类型键 ai / education 可读得多。
-_TYPE_CN_HINT_COLS = ('category', '领域', '分类', 'discipline')
+# 统一表头后 csv-edu 的 label-ai.csv 用 label_cn（「AI领域」）、
+# label-education.csv 亦为「教育领域」，比直接显示类型键 ai / education 可读得多。
+# 保留 category / 领域 等旧列名以兼容旧数据。
+_TYPE_CN_HINT_COLS = ('label_cn', 'category', '领域', '分类', 'discipline')
 
 # 无意义的占位名称，建图与导入时均过滤
 _JUNK_NAMES = {'暂无', '无', '未知', ''}
 
-# 详情展示时跳过的属性列（实体自身字段与长 URL，避免与名称重复或撑爆详情面板）
-_SKIP_ATTRS = {'mhy_id', 'id', 'name', 'label', 'icon'}
+# 详情展示时跳过的属性列（实体自身字段与长 URL，避免与名称重复或撑爆详情面板）。
+# ``name_cn`` / ``label`` / ``label_cn`` 是结构列：中文名与类型中文名分别在
+# 标题里单独显示，不该再作为业务属性重复出现。
+# ⚠️ 中文名属性 CN_NAME_KEY（``name_cn``）虽被跳过，但导入时会**显式**写回
+# ``attrs[CN_NAME_KEY]``，所以跳过只影响「从 CSV 列自动收集」这一步，不会丢名。
+_SKIP_ATTRS = {'mhy_id', 'id', 'name', 'label', 'label_cn', 'icon',
+               CN_NAME_KEY, EN_NAME_KEY}
 
 # 关系文件名可识别的别名（除 label-*.csv / rel-*.csv 约定外的友好命名）
 _NODE_ALIASES = {'nodes.csv', 'node.csv', '实体.csv', '节点.csv'}
@@ -178,6 +191,10 @@ CREATE INDEX IF NOT EXISTS idx_kg_edges_dst ON kg_edges(dst_type, dst_name);
 CREATE TABLE IF NOT EXISTS kg_rel_names (
     rel TEXT PRIMARY KEY,
     cn  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kg_type_names (
+    type TEXT PRIMARY KEY,
+    cn   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS kg_meta (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -273,6 +290,16 @@ def type_cn(ntype):
     return entry[0] if entry else ntype
 
 
+def _is_cn_text(text):
+    """判断字符串是否含中日文字符。
+
+    用于「实体主键是英文名还是中文名」的判定：统一表头后主键优先取英文名，
+    原神实体因暂无官方译名而回退成中文名。判据是**有无汉字**——
+    英文名里混中文标点不算中文名。
+    """
+    return any('一' <= ch <= '鿿' for ch in (text or ''))
+
+
 def _looks_like_type_key(text):
     """判断一个字符串能否充当实体类型键。
 
@@ -312,6 +339,9 @@ class KGStore:
 
         self.nodes = {}                      # (type, name) -> {'type','name','attrs'}
         self._name_index = defaultdict(list)  # name -> [(type, name), ...]
+        # 中文名 -> 节点键。⚠️ 主键是英文名，中文名在属性里，故中文查询
+        # 必须另建索引，否则 find('大规模基础模型') 一无所获。
+        self._cn_index = defaultdict(list)
         self.adj = defaultdict(list)         # (type, name) -> [(rel, (type, name)), ...]
         self._edges = set()                  # 有向三元组 {(k1, rel, k2), ...}
         self._weights = {}                   # (k1, rel, k2) -> float
@@ -348,15 +378,20 @@ class KGStore:
         ``kg_rel_names`` 是**新表**（不是新列），``executescript`` 里的
         ``CREATE TABLE IF NOT EXISTS`` 已经会建好，无需额外处理；
         老库的关系中文名沿用静态兜底表 :data:`REL_NAMES`。
+
+        🔴 末尾的「补注册库里的类型」必须**无条件**执行，不能只放在补weight
+        列的分支里：``NODE_TYPES`` 是**进程级全局**，导入外部图谱时注册的类型
+        不随数据库持久化。程序重启后新进程里它又是空的，于是 edu 的
+        ``ai`` / ``education`` / ``database`` 全部查不到中文名与配色——
+        节点在画布上渲染成**灰点**、详情与图例显示生类型键（实测 kg.db 里
+        明明存着这些类型，界面上却认不出）。故每次打开库都按库里的实际
+        类型补一遍注册。
         """
         cols = {row['name'] for row in
                 self._conn.execute('PRAGMA table_info(kg_edges)')}
         if 'weight' not in cols:
             with self._conn:
                 self._conn.execute('ALTER TABLE kg_edges ADD COLUMN weight REAL')
-            # 库里的类型可能来自旧版导入（那时类型表是封闭的），补注册以免渲染退化为灰点
-            for row in self._conn.execute('SELECT DISTINCT type FROM kg_nodes'):
-                register_type(row['type'])
             self.set_meta('schema_version', SCHEMA_VERSION)
         elif self.get_meta('schema_version') != SCHEMA_VERSION:
             # v2→v3 只新增了 kg_rel_names 表（executescript 已建好），
@@ -364,10 +399,21 @@ class KGStore:
             # 放在 weight 分支之外：v2 库**有** weight 列，只补版本号即可。
             self.set_meta('schema_version', SCHEMA_VERSION)
 
+        # 库里的类型补注册（幂等）：库可能来自旧版导入，或由用户导入外部图谱
+        # 而来，这些类型当初是靠 import_csv 的内存副作用注册的，进程退出即丢。
+        # 中文名与配色优先取库里的登记（kg_type_names），这样重启后
+        # ``ai`` 仍显示「AI领域」而不是生类型键 ``ai``。
+        saved_cn = {row['type']: row['cn'] for row in
+                    self._conn.execute('SELECT type, cn FROM kg_type_names')
+                    if row['type'] and row['cn']}
+        for row in self._conn.execute('SELECT DISTINCT type FROM kg_nodes'):
+            register_type(row['type'], cn=saved_cn.get(row['type']))
+
     def _reindex(self):
         """从数据库全量重建内存索引（写入后调用；1900 节点/7500 边耗时毫秒级）。"""
         self.nodes.clear()
         self._name_index.clear()
+        self._cn_index.clear()
         self.adj.clear()
         self._edges.clear()
         self._weights.clear()
@@ -386,6 +432,9 @@ class KGStore:
             key = _key(row['type'], row['name'])
             self.nodes[key] = {'type': key[0], 'name': key[1], 'attrs': attrs}
             self._name_index[key[1]].append(key)
+            cn = attrs.get(CN_NAME_KEY)
+            if cn:
+                self._cn_index[cn].append(key)
 
         seen_und = set()   # 同一关系的正反向只建一条邻接，避免可视化出现重复边
         for row in self._conn.execute(
@@ -453,8 +502,34 @@ class KGStore:
                 'nodes': len(self.nodes), 'edges': len(self._edges)}
 
     def find(self, name):
-        """精确查找名称对应的节点键列表。"""
-        return list(self._name_index.get((name or '').strip(), []))
+        """精确查找名称对应的节点键列表。
+
+        **中英文都能查到**：主键是英文名，但用户很可能输入中文名
+        （如「璃月」找璃月、「大规模基础模型」找 foundation model），
+        故中文名另建索引一并查。
+        """
+        text = (name or '').strip()
+        keys = list(self._name_index.get(text, []))
+        if keys:
+            return keys
+        keys = self._cn_index.get(text, [])
+        if keys:
+            return list(keys)
+        return self._find_by_en_name(text)
+
+    def _find_by_en_name(self, text):
+        """按英文名精确查找（:attr:`EN_NAME_KEY` 属性）。
+
+        英文名恰好等于主键时不会存成属性，故这里还要扫主键。
+        """
+        if not text:
+            return []
+        found = [key for key, node in self.nodes.items()
+                 if node['attrs'].get(EN_NAME_KEY) == text]
+        if not found:
+            found = [key for key in self.nodes
+                     if key[1] == text and not _is_cn_text(text)]
+        return found
 
     def resolve(self, name, prefer_types=()):
         """按名称解析唯一节点键；多义名按 prefer_types 消歧；无解返回 None。"""
@@ -471,8 +546,10 @@ class KGStore:
     def search(self, text, limit=50):
         """子串模糊搜索，优先前缀匹配，返回 [(type, name), ...]。
 
-        同时匹配中文别名（``label_cn``）——csv-edu 这类数据实体名是英文、
-        中文名在 label 列，只搜英文的话用户按中文就找不到。
+        **三个字段都搜**：中文名（主键）、英文名（``name_en``）、
+        类型中文名（``label_cn``）。前者保证中文输入能找到实体，
+        后两者让「按英文名」「按领域词」也能搜到——否则用户输入
+        ``Liyue`` 或 ``AI领域`` 会一无所获。
         """
         text = (text or '').strip()
         if not text:
@@ -485,24 +562,27 @@ class KGStore:
                 elif text in name:
                     substr.append(key)
         if len(prefix) + len(substr) < limit:
-            for key in self._search_cn_alias(text, limit):
+            for key in self._search_by_attr(text, (CN_NAME_KEY, EN_NAME_KEY),
+                                            limit):
                 if key not in prefix and key not in substr:
                     prefix.append(key)
         return (prefix + substr)[:limit]
 
-    def _search_cn_alias(self, text, limit):
-        """按中文名（label_cn 属性）匹配节点键，英文名优先的结果已由调用方排除。"""
+    def _search_by_attr(self, text, keys, limit):
+        """按若干属性键做子串匹配，前缀命中排前面。"""
         found = []
-        for key, node in self.nodes.items():
-            cn = node['attrs'].get(CN_NAME_KEY) or ''
-            if cn.startswith(text):
-                found.insert(0, key)
-            elif text in cn:
-                found.append(key)
-            if len(found) >= limit:
-                break
+        for attr in keys:
+            for key, node in self.nodes.items():
+                val = node['attrs'].get(attr) or ''
+                if not val:
+                    continue
+                if val.startswith(text):
+                    found.insert(0, key)
+                elif text in val:
+                    found.append(key)
+                if len(found) >= limit:
+                    break
         return found
-
 
     def neighbors(self, key):
         """节点的全部邻居：[(rel英文, rel中文, 邻居键), ...]，按关系分组排序。"""
@@ -560,9 +640,45 @@ class KGStore:
         return result
 
     def node_cn_name(self, key):
-        """节点的中文名（无则返回空串）。"""
+        """节点的中文名（无则返回空串）。
+
+        ⚠️ 中文名**恰好等于主键**时不会存成属性（避免与主键重复），
+        故这里要回退：主键含汉字即它本身就是中文名。
+        否则原神实体（主键是中文名）会一律返回空串。
+        """
         node = self.nodes.get(key)
-        return (node['attrs'].get(CN_NAME_KEY) or '') if node else ''
+        if node is None:
+            return ''
+        cn = node['attrs'].get(CN_NAME_KEY)
+        if cn:
+            return cn
+        return key[1] if _is_cn_text(key[1]) else ''
+
+    def node_en_name(self, key):
+        """节点的英文名（无则返回空串）。
+
+        ⚠️ 统一表头后**实体主键就是英文名**，故主键非中文时才把它当英文名；
+        原神实体主键是中文（暂无译名，回退到 name_cn），返回空串。
+        不要只看 :attr:`EN_NAME_KEY` 属性——英文名恰好等于主键时不会
+        存成属性（避免与主键重复），那样查属性会误报「没有英文名」。
+        """
+        node = self.nodes.get(key)
+        if node is None:
+            return ''
+        en = node['attrs'].get(EN_NAME_KEY)
+        if en:
+            return en
+        # 主键是英文名（edu 侧）：含非中日文字符即视为英文名
+        name = key[1]
+        return '' if _is_cn_text(name) else name
+
+    def node_display(self, key):
+        """节点该优先显示的名字：有英文名用英文名，否则用中文名。
+
+        画布节点标签用它——这样 csv-edu（英文名齐全）显示英文，
+        原神（暂无英文名）自动退回中文，不会出现空标签。
+        """
+        return self.node_en_name(key) or self.node_cn_name(key) or key[1]
 
     # ---------- 关系中文名 ----------
 
@@ -854,30 +970,41 @@ class KGStore:
 
         1. **不能让 ``type`` 列优先**：``label-artifacts.csv`` 自带 type 列
            （圣遗物部位：花/羽/沙/杯/冠），若按它归类会丢掉全部 189 个圣遗物。
-        2. **``label`` 列有两种语义**：原神数据里它是类型键（``character``），
-           而 csv-edu 里它是**中文名**（``大规模基础模型``）。故只有当取值
-           长得像类型键时才当类型用，否则落到 :data:`CN_NAME_KEY` 属性。
-           判据是「能否解析为合法类型键」，不是「是否等于文件名类型」。
+        2. **主键取 ``name``（英文名），空时回退 ``name_cn``**：中文名
+           **不唯一**——csv-edu 有 11 组同中文名（``RLHF`` 与
+           ``reinforcement learning from human feedback`` 共用同一中文名），
+           原神也有「凯瑟琳」×4。拿中文名当主键会让同一概念裂成多个实体
+           （实测节点 732→1392、关系 1063→784）。英文名则唯一。
+           而原神实体的 ``name`` 目前**多为空**（官方译名待补，仅 country
+           有 7 个），故必须能回退到中文名，否则整表被丢弃。
         3. **未知类型要自动注册**：``label-ai.csv`` / ``label-education.csv``
            的类型不在内置 12 项里，早期版本因此把整表丢弃。
+
+        **兼容旧表头**：没有 ``name_cn`` 列时（旧数据把中文名放在 ``label`` 列）
+        仍按老规则猜——``label`` 像类型键就当类型，否则当中文名。
         """
         rows = []
-        # 收集每个类型下 category/领域 列的取值分布，用于给新类型起中文名
+        # 收集每个类型下 label_cn/category/领域 列的取值分布，用于给新类型起中文名
         pending_types = {}    # ntype -> Counter()
         with open(path, 'r', encoding='utf-8-sig', newline='') as f:
             reader = csv.DictReader(f)
+            unified = 'name_cn' in (reader.fieldnames or [])
             for raw in reader:
-                name = _clean_name(raw.get('name'))
-                if not name:
-                    continue
                 label = (raw.get('label') or '').strip()
-                ntype, cn_name = '', ''
-                # label 优先：像类型键就用它，否则视为中文名
-                if label:
-                    if label in NODE_TYPES or _looks_like_type_key(label):
-                        ntype = label
-                    else:
-                        cn_name = label
+                ntype, cn_name, en_name = '', '', ''
+                if unified:
+                    # 新表头：语义明确，无需猜测
+                    en_name = (raw.get('name') or '').strip()
+                    cn_name = (raw.get('name_cn') or '').strip()
+                    ntype = label
+                else:
+                    # 旧表头：name 就是主键；label 可能是类型键，也可能是中文名
+                    en_name = (raw.get('name') or '').strip()
+                    if label:
+                        if label in NODE_TYPES or _looks_like_type_key(label):
+                            ntype = label
+                        else:
+                            cn_name = label
                 for cand in (default_type, raw.get('type')):
                     if ntype:
                         break
@@ -886,11 +1013,17 @@ class KGStore:
                         ntype = cand
                 if not ntype:
                     continue
+                # 主键 = 英文名；原神暂无译名时回退中文名（否则整表丢弃）
+                key_name = _clean_name(en_name) or _clean_name(cn_name)
+                if not key_name:
+                    continue
                 attrs = _clean_attrs(raw)
-                # 中文名有独立属性位：导出会写回 label 列，往返不丢
-                if cn_name:
+                # 中文名/英文名各有独立属性位，导出时写回，往返不丢
+                if cn_name and cn_name != key_name:
                     attrs[CN_NAME_KEY] = cn_name
-                rows.append((ntype, name, attrs))
+                if en_name and en_name != key_name:
+                    attrs[EN_NAME_KEY] = en_name
+                rows.append((ntype, key_name, attrs))
                 if ntype not in NODE_TYPES:
                     bucket = pending_types.setdefault(ntype, Counter())
                     for col in _TYPE_CN_HINT_COLS:
@@ -899,10 +1032,14 @@ class KGStore:
                             bucket[val] += 1
                             break
         # 类型注册放在循环外：需要整表统计后才能取到众数（如 AI领域 / 教育领域）
+        type_cn_map = {}
         for ntype, counter in pending_types.items():
             top = counter.most_common(1)
-            register_type(ntype, cn=top[0][0] if top else None)
-        return rows
+            cn = top[0][0] if top else None
+            register_type(ntype, cn=cn)
+            if cn:
+                type_cn_map[ntype] = cn
+        return rows, type_cn_map
 
     @classmethod
     def _parse_rel_file(cls, path, hint_types=()):
@@ -960,6 +1097,7 @@ class KGStore:
         known_types = set(NODE_TYPES)
         node_rows, rel_rows, ignored = [], [], []
         rel_cn_map = {}       # 本次导入发现的关系中文名 {rel: cn}
+        type_cn_map = {}      # 本次导入发现的类型中文名 {type: cn}
         for f in files:
             base = os.path.basename(f).lower()
             if base.startswith('label-') and base.endswith('.csv'):
@@ -967,7 +1105,10 @@ class KGStore:
                 # 文件名类型合法才作为类型（label-ai-notes.csv 之类的备注表不该建实体）。
                 # 注册交给 _parse_node_file：它要统计整表才能给新类型起中文名。
                 if _looks_like_type_key(ntype):
-                    node_rows.extend(self._parse_node_file(f, ntype))
+                    rows, cn_map = self._parse_node_file(f, ntype)
+                    node_rows.extend(rows)
+                    for t, cn in cn_map.items():
+                        type_cn_map.setdefault(t, cn)
                 else:
                     ignored.append(os.path.basename(f))
                 continue
@@ -986,7 +1127,10 @@ class KGStore:
                 for rel, cn in cn_map.items():
                     rel_cn_map.setdefault(rel, cn)
             elif 'name' in cols and (cols & {'label', 'type'}) or base in _NODE_ALIASES:
-                node_rows.extend(self._parse_node_file(f))
+                rows, cn_map = self._parse_node_file(f)
+                node_rows.extend(rows)
+                for t, cn in cn_map.items():
+                    type_cn_map.setdefault(t, cn)
             else:
                 ignored.append(os.path.basename(f))
 
@@ -1000,8 +1144,12 @@ class KGStore:
                   'edges_added': 0, 'edges_skipped': 0, 'stubs': 0,
                   'edges_weighted': 0, 'new_types': [],
                   'rel_cn_added': 0}
-        # 事务内自建名称索引：新插入的实体必须立即能被后续关系解析到
+        # 事务内自建名称索引：新插入的实体必须立即能被后续关系解析到。
+        # ⚠️ **同时索引中文名**：实体主键是英文名，而 ``rel-*.csv`` 引用的是
+        # 中文名（``璃月``、``可莉``），故中文名也必须进索引才能解析到端点。
+        # 否则所有关系都会因端点找不到而变成桩（实测关系数 1063→784）。
         name_index = defaultdict(list)
+        cn_index = defaultdict(list)
         with self._conn:
             if replace:
                 self._conn.execute('DELETE FROM kg_edges')
@@ -1010,9 +1158,14 @@ class KGStore:
                 # 留着旧登记会让本次没带 rel_cn 的表仍显示陈旧中文名
                 self._conn.execute('DELETE FROM kg_rel_names')
                 self._rel_cn.clear()
+                # 类型中文名同属图谱数据：replace 语义是「清空后重建」
+                self._conn.execute('DELETE FROM kg_type_names')
             else:
                 for key in self.nodes:
                     name_index[key[1]].append(key)
+                    cn = self.nodes[key]['attrs'].get(CN_NAME_KEY)
+                    if cn:
+                        cn_index[cn].append(key)
 
             for ntype, name, attrs in node_rows:
                 key = _key(ntype, name)
@@ -1026,6 +1179,9 @@ class KGStore:
                     (ntype, name, json.dumps(attrs, ensure_ascii=False)))
                 if key not in name_index[name]:
                     name_index[name].append(key)
+                cn = attrs.get(CN_NAME_KEY)
+                if cn and key not in cn_index[cn]:
+                    cn_index[cn].append(key)
 
             # 关系中文名与节点/关系同在一个事务里落库：
             # 中途失败不会留下「有边没中文名」的半成品。
@@ -1043,13 +1199,21 @@ class KGStore:
                 self._rel_cn[rel] = cn
                 report['rel_cn_added'] += 1
 
+            # 类型中文名同样落库：否则重启后新进程的NODE_TYPES 是空的，
+            # 补注册只能拿到生类型键，画布上edu 节点变灰点、图例显示「ai」。
+            for ntype, cn in type_cn_map.items():
+                self._conn.execute(
+                    'INSERT OR REPLACE INTO kg_type_names (type, cn) VALUES (?, ?)',
+                    (ntype, cn))
+
             for n1, rel, n2, hints, weight in rel_rows:
-                k1 = self._import_endpoint(n1, hints, name_index, report)
+                k1 = self._import_endpoint(n1, hints, name_index, report,
+                                          cn_index=cn_index)
                 # 同一行两端不取同类型桩：rel-character-element.csv 的两个未知实体
                 # 应分别落为 人物/元素，而不是都被建成人物
                 used = {k1[0]} if k1 else set()
                 k2 = self._import_endpoint(n2, hints, name_index, report,
-                                           avoid=used)
+                                           avoid=used, cn_index=cn_index)
                 if k1 is None or k2 is None or k1 == k2:
                     report['edges_skipped'] += 1
                     continue
@@ -1072,12 +1236,19 @@ class KGStore:
                                for t in sorted(set(NODE_TYPES) - known_types)]
         return report
 
-    def _import_endpoint(self, name, hint_types, name_index, report, avoid=()):
+    def _import_endpoint(self, name, hint_types, name_index, report, avoid=(),
+                         cn_index=None):
         """解析导入关系的端点：命中已有实体则复用，否则按类型提示建桩实体。
 
         ``avoid`` 是同一行已占用的类型（来自另一端），用于避免两端建成同类桩。
+
+        ⚠️ **按中文名也能命中**：实体主键是英文名，而 ``rel-*.csv`` 引用的是
+        中文名（``璃月``、``可莉``），故先查英文名索引、再查中文名索引。
+        缺了后者，所有关系端点都解析不到、全部退化成桩（实测关系 1063→784）。
         """
-        candidates = name_index.get(name, [])
+        candidates = list(name_index.get(name, []))
+        if not candidates and cn_index:
+            candidates = list(cn_index.get(name, []))
         if len(candidates) == 1:
             return candidates[0]
         if candidates:
@@ -1124,6 +1295,9 @@ class KGStore:
         """导出为项目原始 CSV 布局：``label-<类型>.csv`` + ``rel-<a>-<b>.csv``。
 
         - 关系按真实方向写入文件名（如 地区→国家 导出为 ``rel-area-country.csv``）；
+        - 实体表用**统一表头** ``name_cn``(中文) / ``label``(类型键)，
+          有英文名时额外写 ``name`` 列；与 data/csv、data/csv-edu 的
+          布局一致，导出目录可直接整目录回灌；
         - **带权重的关系表会多写一列 weight**（全部是默认权重时不写，保持与
           旧版导出逐字节一致，不给下游 diff 制造噪声）；
         - **库里有登记的关系表会多写一列 rel_cn**（同样按需出现），
@@ -1148,20 +1322,35 @@ class KGStore:
             if not rows:
                 continue
             # 属性列取该类型全部实体的并集，顺序按首次出现，保持导出稳定。
-            # CN_NAME_KEY 不作为独立列导出——它已归位到 label 列
+            # 名称类属性（中文名/英文名）不作为独立列——它们已归位到
+            # name_cn / name 两列，与实体表统一表头一致。
             columns = []
             for n in rows:
                 for k in n['attrs']:
-                    if k != CN_NAME_KEY and k not in columns:
+                    if k not in (CN_NAME_KEY, EN_NAME_KEY) and k not in columns:
                         columns.append(k)
             path = os.path.join(out_dir, f'label-{ntype}.csv')
+            # 与实体表统一表头：name_cn(中文) / label(类型键)，有英文名时
+            # 额外写name 列。⚠️ 判「有没有英文名」必须用 :meth:`node_en_name`
+            # 而不是只看 EN_NAME_KEY 属性——英文名恰好等于主键时（country
+            # 的Liyue/璃月）不会存成属性，只看属性会误判为「无英文名」，
+            # 导出时把英文名丢了，回灌就退化成中文名主键、同一国家裂成两个节点。
+            has_en = any(self.node_en_name(_key(ntype, n['name']))
+                         for n in rows)
+            header = ['name_cn', 'label']
+            if has_en:
+                header.insert(0, 'name')
             with open(path, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['name', 'label'] + columns)
+                writer.writerow(header + columns)
                 for n in sorted(rows, key=lambda x: x['name']):
-                    label = n['attrs'].get(CN_NAME_KEY) or ntype
-                    writer.writerow([n['name'], label]
-                                    + [n['attrs'].get(c, '') for c in columns])
+                    key = _key(ntype, n['name'])
+                    cn = self.node_cn_name(key) or n['name']
+                    row = [cn, n['type']]
+                    if has_en:
+                        row.insert(0, self.node_en_name(key))
+                    writer.writerow(row + [n['attrs'].get(c, '')
+                                           for c in columns])
             node_files += 1
             node_rows += len(rows)
 

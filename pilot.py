@@ -677,8 +677,8 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     # 明确用 ApplicationName：任务栏与 Alt+Tab 显示的是这个名字，
     # 而不是可执行文件名（PyInstaller 的 exe 名带中文时尤其明显）
-    app.setApplicationName('原神桌面伙伴')
-    app.setApplicationDisplayName('原神桌面伙伴')
+    app.setApplicationName('桌面伙伴-Pilot')
+    app.setApplicationDisplayName('桌面伙伴-Pilot')
     app.setOrganizationName('Pilot-KG')
     pilot = Pilot()
     sys.exit(app.exec())

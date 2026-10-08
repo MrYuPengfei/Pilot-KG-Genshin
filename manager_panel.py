@@ -37,7 +37,7 @@ from kg_store import (NODE_TYPES, get_default_store, reset_default_store,
 from kg_editor import NodeEditDialog, EdgeEditDialog
 from kg_view import KGCanvas
 
-APP_VERSION = '3.8.2'
+APP_VERSION = '3.8.3'
 REPO_URL = 'https://github.com/MrYuPengfei/Pilot-KG-Genshin.git'
 
 
@@ -50,6 +50,35 @@ def rel_label(kg, rel):
     """
     cn = kg.rel_cn_of(rel) if kg is not None else rel_cn(rel)
     return cn if cn == rel else f'{cn} {rel}'
+
+
+# 实体属性键 -> 中文显示名。详情面板用它替代英文键名，
+# 否则用户看到的是 description-chinese / cite-bibtex 这类原始列名。
+# 未登记的键回落原名（显示英文总比不显示好），故新数据加列也不会白屏。
+ATTR_LABELS = {
+    # 跨图谱通用
+    'category': '所属领域', 'year': '年份', 'cite-bibtex': '引用文献',
+    'description': '描述', 'description-chinese': '中文描述',
+    'label': '类型', 'type': '类型', 'icon': '图标', 'id': '编号',
+    'name_cn': '中文名', 'name_en': '英文名',
+    # 原神图谱
+    'introduction': '简介', 'nick_name': '别称', 'title': '称号',
+    'gender': '性别', 'rarity': '稀有度', 'pool': '卡池', 'element': '元素',
+    'constellation': '星座', 'constellation2': '套装', 'country': '国家',
+    'special_cuisine': '特色料理', 'equip_date': '上线时间', 'tag': '标签',
+    'weapon_type': '武器类型', 'organization': '所属组织',
+    'break_material': '突破材料', 'skill_material': '天赋材料',
+    'weapon_choice': '推荐武器', 'army': '所属势力', 'eng_name': '英文名',
+    'story': '背景故事', 'role': '定位', 'profession': '职业',
+    'condition': '获取条件', 'using': '使用方法', 'material': '材料',
+    'refine': '精炼', 'task': '任务', 'dropping': '掉落', 'attack': '攻击',
+    'weakness': '弱点', 'effect': '效果', 'getting': '获取',
+}
+
+
+def attr_label(key):
+    """属性键的中文显示名（未登记则返回原键名）。"""
+    return ATTR_LABELS.get(key, key)
 
 # 全局按钮尺寸：管理面板**所有页**的按钮一律用这个尺寸，保证视觉一致。
 # 必须显式 setFixedSize——同一行的 QPushButton 默认 sizePolicy 会被拉伸成等宽，
@@ -113,7 +142,7 @@ def load_help_html(base_dir, app_version=APP_VERSION, repo_url=REPO_URL,
     candidates = help_file_candidates(base_dir)
     path = next((p for p in candidates if os.path.isfile(p)), None)
     if path is None:
-        content = (f'<h2>原神桌面伙伴 v{app_version} · 帮助文档</h2>'
+        content = (f'<h2>桌面伙伴-Pilot v{app_version} · 帮助文档</h2>'
                    f'<p style="color:#c0392b"><b>未能载入帮助文件 '
                    f'{HELP_FILE}</b></p>'
                    f'<p>帮助文档随程序一起安装在 <code>_internal</code> 目录下。'
@@ -124,7 +153,7 @@ def load_help_html(base_dir, app_version=APP_VERSION, repo_url=REPO_URL,
             with open(path, 'r', encoding='utf-8') as f:
                 content = f.read()
         except OSError as e:
-            content = (f'<h2>原神桌面伙伴 v{app_version} · 帮助文档</h2>'
+            content = (f'<h2>桌面伙伴-Pilot v{app_version} · 帮助文档</h2>'
                        f'<p style="color:#c0392b">帮助文件读取失败：'
                        f'{html.escape(str(e))}</p>')
     return (content
@@ -148,7 +177,7 @@ class ManagerPanel(QMainWindow):
         self.config = config
         # v3.4：配置以 SQLite 为准（config.db），config dict 是其内存副本
         self.config_store = pilot.config_store
-        self.setWindowTitle(f'原神桌面伙伴 v{APP_VERSION} · 管理面板')
+        self.setWindowTitle(f'桌面伙伴-Pilot v{APP_VERSION} · 管理面板')
         self.setWindowIcon(self._app_icon())
 
         # 显式声明标准窗口：带标题栏与最小化/最大化/关闭按钮，
@@ -258,7 +287,7 @@ class ManagerPanel(QMainWindow):
         self.win_state_label = QLabel('-')
         self.cur_role_label = QLabel('-')
         self.store_label = QLabel('-')
-        self.version_label = QLabel(f'原神桌面伙伴 v{APP_VERSION}')
+        self.version_label = QLabel(f'桌面伙伴-Pilot v{APP_VERSION}')
         info_form.addRow('窗口状态:', self.win_state_label)
         info_form.addRow('当前伙伴:', self.cur_role_label)
         info_form.addRow('资源库:', self.store_label)
@@ -564,17 +593,24 @@ class ManagerPanel(QMainWindow):
         self._kg_current = key
         cn_type = NODE_TYPES.get(key[0], (key[0],))[0]
         cn_name = self.kg.node_cn_name(key)
-        title = f'{html.escape(key[1])}'
-        if cn_name:
-            title += f' <small style="color:#7f8c8d">{html.escape(cn_name)}</small>'
+        en_name = self.kg.node_en_name(key)
+        # 主键是英文名（edu）/ 中文名（原神暂无译名）。标题给全名：
+        # 主名用 node_display（英文优先、无英文名退回中文），另一语言作副标题。
+        title = html.escape(self.kg.node_display(key))
+        other = cn_name if en_name else ''
+        if other and other != title:
+            title += f' <small style="color:#7f8c8d">{html.escape(other)}</small>'
         parts = [f'<h3>{title} <small style="color:#7f8c8d">[{cn_type}]</small></h3>']
-        if node['attrs']:
+        attrs = node['attrs']
+        if attrs:
             parts.append('<table border="0" cellspacing="0" cellpadding="2">')
-            for k, v in node['attrs'].items():
+            for k, v in attrs.items():
                 v = v.replace('<', '&lt;')
                 if len(v) > 300:
                     v = v[:300] + '…'
-                parts.append(f'<tr><td><b>{k}</b></td><td>{v}</td></tr>')
+                # 属性键给中文显示名（description→描述），未知键回落原名
+                label = html.escape(attr_label(k))
+                parts.append(f'<tr><td><b>{label}</b></td><td>{v}</td></tr>')
             parts.append('</table>')
         else:
             parts.append('<p style="color:#7f8c8d">（无属性）</p>')
@@ -596,7 +632,13 @@ class ManagerPanel(QMainWindow):
         for rel, other, direction, weight, cn in self.kg.edges_of_detailed(key):
             o_type = NODE_TYPES.get(other[0], (other[0],))[0]
             arrow = '→' if direction == 'out' else '←'
-            label = other[1] + (f'（{cn}）' if cn else '')
+            # 对端也中英并列：主键是英文名时附中文名，反之附英文名
+            label = self.kg.node_display(other)
+            other_cn = self.kg.node_cn_name(other)
+            other_en = self.kg.node_en_name(other)
+            alias = other_cn if other_en else other_en
+            if alias and alias != label:
+                label += f'（{alias}）'
             w_mark = '' if weight == DEFAULT_WEIGHT else \
                 f'  · {int(weight) if float(weight).is_integer() else weight}'
             # 库里登记过的中文名优先（rel_cn_of），静态表只作兜底

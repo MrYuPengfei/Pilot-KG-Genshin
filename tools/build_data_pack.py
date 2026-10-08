@@ -84,7 +84,7 @@ def build(out_dir, only=None):
         made.append(_make_zip(target, entries))
 
     print('\n发布说明可附在数据包中：把压缩包解压到程序安装目录'
-          '（与 原神桌面伙伴.exe 同级的 _internal 目录）即生效。')
+          '（与 桌面伙伴-Pilot.exe 同级的 _internal 目录）即生效。')
     return made
 
 
