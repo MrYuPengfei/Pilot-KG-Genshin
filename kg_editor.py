@@ -250,7 +250,10 @@ class EdgeEditDialog(QDialog):
 
         self.rel_edit = QLineEdit()
         self.rel_edit.setPlaceholderText('关系名，如 element_is / part_of')
-        completer = QCompleter(sorted({*REL_NAMES, *REL_NAMES.values()}), self)
+        # 自动完成同时给英文名与中文名：库里登记过的关系也一并纳入
+        # （外部图谱的关系中文名存在 kg_rel_names，静态表里没有）
+        names = kg.rel_names() if kg is not None else dict(REL_NAMES)
+        completer = QCompleter(sorted({*names, *names.values()}), self)
         completer.setCaseSensitivity(Qt.CaseInsensitive)
         completer.setFilterMode(Qt.MatchContains)
         self.rel_edit.setCompleter(completer)
@@ -316,11 +319,14 @@ class EdgeEditDialog(QDialog):
 
     def _update_hint(self, text):
         text = (text or '').strip()
-        if text:
-            cn = REL_NAMES.get(text)
-            self.rel_hint.setText(f'显示为「{cn}」' if cn else '自定义关系名（无中文映射）')
-        else:
+        if not text:
             self.rel_hint.setText('')
+            return
+        cn = self.kg.rel_cn_of(text) if self.kg is not None else REL_NAMES.get(text)
+        if cn and cn != text:
+            self.rel_hint.setText(f'画布上显示为「{cn} {text}」')
+        else:
+            self.rel_hint.setText('自定义关系名（无中文映射，画布上显示原文）')
 
     def _swap(self):
         a, b = self.src.type_combo.currentData(), self.src.text()

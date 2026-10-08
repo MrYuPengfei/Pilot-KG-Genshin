@@ -1,11 +1,16 @@
 """原神知识图谱存储层：SQLite 持久化 + 内存索引 + CSV 导入导出 + 节点/关系编辑。
 
-数据库（默认 <程序目录>/kg.db，与 assets.db 并列）包含三张表：
+数据库（默认 <程序目录>/kg.db，与 assets.db 并列）包含四张表：
 
 - ``kg_nodes(type, name, attrs)``  实体，``attrs`` 为 JSON 字符串，主键 (type, name)；
-- ``kg_edges(id, src_type, src_name, rel, dst_type, dst_name)``  有向三元组，
+- ``kg_edges(id, src_type, src_name, rel, dst_type, dst_name, weight)``  有向三元组，
   唯一约束防止重复，同一 (端点, 关系) 的反向重复也只保留一条；
+- ``kg_rel_names(rel, cn)``  关系英文名 -> 中文名（**按关系名去重的字典表**）；
 - ``kg_meta(key, value)``  播种标记等元信息。
+
+⚠️ 关系中文名单独成表而不是 ``kg_edges`` 加一列：中文名是**关系名**的属性，
+而一条关系名在图里往往出现几十次（``drop_from`` 有 2606 条边）。放边上会
+把同一个词重复存 2606 遍；放表里则天然唯一，导入导出也只写一次。
 
 首次运行若库为空，自动从 ``data/csv`` 播种（``label-<类型>.csv`` 节点、
 ``rel-<a>-<b>.csv`` 关系）；此后 CSV 仅作为导入/导出格式，运行时数据以库为准。
@@ -130,6 +135,11 @@ DEFAULT_WEIGHT = 1.0
 # 权重列可接受的表头别名（csv-edu 用 weight，别的来源可能写 权重/weight值）
 _WEIGHT_COLS = ('weight', '权重', '权重值', 'strength', '置信度')
 
+# ⚠️ 关系中文名的列名别名。csv-edu 的 rel-*.csv 原本只有 node1,rel,node2,weight，
+# 324 个关系名里有 293 个查不到中文，渲染时只能显示生英文。
+# 加一列 ``rel_cn``（或中文别名）后，中文名随数据走，不再依赖代码里的静态字典。
+_REL_CN_COLS = ('rel_cn', 'rel-cn', 'relcn', '关系', '关系名', '关系中文名')
+
 # 自动注册新类型时用来起中文名的列：取该列在本表内的**众数**。
 # csv-edu 的 label-ai.csv 里 category 多为「AI领域」、label-education.csv 多为
 # 「教育领域」，比直接显示类型键 ai / education 可读得多。
@@ -165,6 +175,10 @@ CREATE TABLE IF NOT EXISTS kg_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_kg_edges_src ON kg_edges(src_type, src_name);
 CREATE INDEX IF NOT EXISTS idx_kg_edges_dst ON kg_edges(dst_type, dst_name);
+CREATE TABLE IF NOT EXISTS kg_rel_names (
+    rel TEXT PRIMARY KEY,
+    cn  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kg_meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -173,7 +187,8 @@ SEED_VERSION = '1'
 # 库结构版本：表结构有变更时递增，供客户端判断能否安全接收服务器下发的数据
 # （C/S 架构预留——服务端与客户端结构版本不匹配时应拒绝导入而非静默出错）
 # v2：kg_edges 增 weight 列（带权重边）
-SCHEMA_VERSION = '2'
+# v3：新增 kg_rel_names 表（关系中文名）
+SCHEMA_VERSION = '3'
 
 
 def _key(ntype, name):
@@ -244,7 +259,11 @@ def _parse_weight(raw, default=DEFAULT_WEIGHT):
 
 
 def rel_cn(rel):
-    """关系键 -> 中文名（未登记则返回原文）。"""
+    """关系键 -> 中文名（未登记则返回原文）。
+
+    这是**静态兜底表**（:data:`REL_NAMES`）的查询。库里登记过的中文名优先，
+    由 :meth:`KGStore.rel_cn_of` 处理——渲染层应调它而不是本函数。
+    """
     return REL_NAMES.get(rel, rel)
 
 
@@ -296,6 +315,7 @@ class KGStore:
         self.adj = defaultdict(list)         # (type, name) -> [(rel, (type, name)), ...]
         self._edges = set()                  # 有向三元组 {(k1, rel, k2), ...}
         self._weights = {}                   # (k1, rel, k2) -> float
+        self._rel_cn = {}                    # rel英文 -> 中文名
         self._reindex()
 
         if auto_seed and not self.nodes and seed_dir:
@@ -319,11 +339,15 @@ class KGStore:
     # ---------- 索引 ----------
 
     def _migrate(self):
-        """老库结构迁移：给 v1 的 kg_edges 补 weight 列。
+        """老库结构迁移：给 v1 的 kg_edges 补 weight 列；给 v2 补 kg_rel_names 表。
 
         ``CREATE TABLE IF NOT EXISTS`` 对已存在的表**不会**加列，
         所以升级安装（kg.db 由 onlyifdoesntexist 保留）后必须显式 ALTER。
         迁移是加列而非改列，老数据读出来 weight 为 NULL，渲染按默认权重处理。
+
+        ``kg_rel_names`` 是**新表**（不是新列），``executescript`` 里的
+        ``CREATE TABLE IF NOT EXISTS`` 已经会建好，无需额外处理；
+        老库的关系中文名沿用静态兜底表 :data:`REL_NAMES`。
         """
         cols = {row['name'] for row in
                 self._conn.execute('PRAGMA table_info(kg_edges)')}
@@ -334,6 +358,11 @@ class KGStore:
             for row in self._conn.execute('SELECT DISTINCT type FROM kg_nodes'):
                 register_type(row['type'])
             self.set_meta('schema_version', SCHEMA_VERSION)
+        elif self.get_meta('schema_version') != SCHEMA_VERSION:
+            # v2→v3 只新增了 kg_rel_names 表（executescript 已建好），
+            # 但版本号要跟上——否则「检查更新」会以为库结构还是 v2。
+            # 放在 weight 分支之外：v2 库**有** weight 列，只补版本号即可。
+            self.set_meta('schema_version', SCHEMA_VERSION)
 
     def _reindex(self):
         """从数据库全量重建内存索引（写入后调用；1900 节点/7500 边耗时毫秒级）。"""
@@ -342,6 +371,12 @@ class KGStore:
         self.adj.clear()
         self._edges.clear()
         self._weights.clear()
+        self._rel_cn.clear()
+
+        # 库里登记的关系中文名优先于静态兜底表
+        for row in self._conn.execute('SELECT rel, cn FROM kg_rel_names'):
+            if row['rel'] and row['cn']:
+                self._rel_cn[row['rel']] = row['cn']
 
         for row in self._conn.execute('SELECT type, name, attrs FROM kg_nodes'):
             try:
@@ -471,7 +506,8 @@ class KGStore:
 
     def neighbors(self, key):
         """节点的全部邻居：[(rel英文, rel中文, 邻居键), ...]，按关系分组排序。"""
-        result = [(rel, rel_cn(rel), other) for rel, other in self.adj.get(key, [])]
+        result = [(rel, self.rel_cn_of(rel), other)
+                  for rel, other in self.adj.get(key, [])]
         result.sort(key=lambda x: (x[0], x[2][0], x[2][1]))
         return result
 
@@ -486,7 +522,7 @@ class KGStore:
             triple = self._directed(key, rel, other)
             weight = self._weights.get(triple, DEFAULT_WEIGHT) if triple else DEFAULT_WEIGHT
             cn = self.nodes.get(other, {}).get('attrs', {}).get(CN_NAME_KEY) or ''
-            result.append((rel, rel_cn(rel), other, weight, cn))
+            result.append((rel, self.rel_cn_of(rel), other, weight, cn))
         result.sort(key=lambda x: (-x[3], x[0], x[2][0], x[2][1]))
         return result
 
@@ -527,6 +563,41 @@ class KGStore:
         """节点的中文名（无则返回空串）。"""
         node = self.nodes.get(key)
         return (node['attrs'].get(CN_NAME_KEY) or '') if node else ''
+
+    # ---------- 关系中文名 ----------
+
+    def rel_cn_of(self, rel):
+        """关系的中文名：库里的登记优先，回退静态表，都没有则返回英文原文。
+
+        渲染层（画布边标签、面板关系列表、编辑器提示）统一走这里，
+        不要直接用模块级 :func:`rel_cn`——后者看不到库里的登记。
+        """
+        cn = self._rel_cn.get(rel)
+        return cn or rel_cn(rel)
+
+    def set_rel_cn(self, rel, cn, overwrite=False):
+        """登记关系中文名，返回 True 表示新建/改写。
+
+        ``overwrite=False``（默认）时已有登记不覆盖：先导入的数据优先，
+        避免后来一份缺列的 CSV 把已有中文名抹掉。
+        """
+        rel = (rel or '').strip()
+        cn = (cn or '').strip()
+        if not rel or not cn:
+            return False
+        if not overwrite and rel in self._rel_cn:
+            return False
+        with self._conn:
+            self._conn.execute('INSERT OR REPLACE INTO kg_rel_names (rel, cn)'
+                               ' VALUES (?, ?)', (rel, cn))
+        self._rel_cn[rel] = cn
+        return True
+
+    def rel_names(self):
+        """全部关系中文名映射（供编辑器做自动完成）。"""
+        merged = dict(REL_NAMES)
+        merged.update(self._rel_cn)
+        return merged
 
 
     def ego_network(self, key, hops=1):
@@ -761,6 +832,17 @@ class KGStore:
                 return lowered[cand]
         return None
 
+    @staticmethod
+    def _rel_cn_column(fieldnames):
+        """找出关系中文名列名；没有则返回 None。"""
+        if not fieldnames:
+            return None
+        lowered = {c.strip().lower(): c for c in fieldnames if c}
+        for cand in _REL_CN_COLS:
+            if cand in lowered:
+                return lowered[cand]
+        return None
+
     @classmethod
     def _parse_node_file(cls, path, default_type=None):
         """解析节点 CSV，产出 (type, name, attrs)。
@@ -824,17 +906,24 @@ class KGStore:
 
     @classmethod
     def _parse_rel_file(cls, path, hint_types=()):
-        """解析关系 CSV，产出 (端点1, 关系, 端点2, 类型提示集合, 权重)。
+        """解析关系 CSV，产出 (端点1, 关系, 端点2, 类型提示集合, 权重)，
+        并返回该表出现过的 ``{关系名: 中文名}``（无 rel_cn 列时为空 dict）。
 
         ``weight`` 可选：无该列时用 :data:`DEFAULT_WEIGHT`；列存在但单元格
         为空/非数字时同样退回默认值（宁可标成默认权重，也不要把关系丢掉）。
+
+        ⚠️ 关系中文名是**按关系名去重**的：同一个 ``derived_from`` 可能在表里
+        出现 20 次，中文名只登记一次（见 :meth:`set_rel_cn`），既省空间也避免
+        同一关系因不同行填了不同中文名而产生分歧。
         """
         rows = []
         hints = tuple(t for t in hint_types
                       if t in NODE_TYPES or _looks_like_type_key(t))
+        cn_map = {}
         with open(path, 'r', encoding='utf-8-sig', newline='') as f:
             reader = csv.DictReader(f)
             wcol = cls._weight_column(reader.fieldnames)
+            ccol = cls._rel_cn_column(reader.fieldnames)
             for raw in reader:
                 n1 = _clean_name(raw.get('node1'))
                 rel = (raw.get('rel') or '').strip()
@@ -843,7 +932,10 @@ class KGStore:
                     continue
                 weight = _parse_weight(raw.get(wcol)) if wcol else DEFAULT_WEIGHT
                 rows.append((n1, rel, n2, hints, weight))
-        return rows
+                cn = (raw.get(ccol) or '').strip() if ccol else ''
+                if cn and rel not in cn_map:
+                    cn_map[rel] = cn
+        return rows, cn_map
 
     def import_csv(self, path, replace=False, _quiet=False):
         """从 CSV 文件或目录导入图谱，返回导入报告。
@@ -867,6 +959,7 @@ class KGStore:
         # 导入前快照类型表，事后取差集即本次自动新增的类型（面板据此提示）
         known_types = set(NODE_TYPES)
         node_rows, rel_rows, ignored = [], [], []
+        rel_cn_map = {}       # 本次导入发现的关系中文名 {rel: cn}
         for f in files:
             base = os.path.basename(f).lower()
             if base.startswith('label-') and base.endswith('.csv'):
@@ -881,11 +974,17 @@ class KGStore:
             if base.startswith('rel-') and base.endswith('.csv'):
                 hints = [h for h in base[len('rel-'):-len('.csv')].split('-')
                          if _looks_like_type_key(h)]
-                rel_rows.extend(self._parse_rel_file(f, hints))
+                rows, cn_map = self._parse_rel_file(f, hints)
+                rel_rows.extend(rows)
+                for rel, cn in cn_map.items():
+                    rel_cn_map.setdefault(rel, cn)
                 continue
             cols = {c.lower() for c in self._read_header(f)}
             if {'node1', 'rel', 'node2'} <= cols or base in _REL_ALIASES:
-                rel_rows.extend(self._parse_rel_file(f))
+                rows, cn_map = self._parse_rel_file(f)
+                rel_rows.extend(rows)
+                for rel, cn in cn_map.items():
+                    rel_cn_map.setdefault(rel, cn)
             elif 'name' in cols and (cols & {'label', 'type'}) or base in _NODE_ALIASES:
                 node_rows.extend(self._parse_node_file(f))
             else:
@@ -899,13 +998,18 @@ class KGStore:
                   'ignored_files': ignored,
                   'nodes_added': 0, 'nodes_updated': 0,
                   'edges_added': 0, 'edges_skipped': 0, 'stubs': 0,
-                  'edges_weighted': 0, 'new_types': []}
+                  'edges_weighted': 0, 'new_types': [],
+                  'rel_cn_added': 0}
         # 事务内自建名称索引：新插入的实体必须立即能被后续关系解析到
         name_index = defaultdict(list)
         with self._conn:
             if replace:
                 self._conn.execute('DELETE FROM kg_edges')
                 self._conn.execute('DELETE FROM kg_nodes')
+                # 关系中文名同属图谱数据：replace 语义是「清空后重建」，
+                # 留着旧登记会让本次没带 rel_cn 的表仍显示陈旧中文名
+                self._conn.execute('DELETE FROM kg_rel_names')
+                self._rel_cn.clear()
             else:
                 for key in self.nodes:
                     name_index[key[1]].append(key)
@@ -922,6 +1026,22 @@ class KGStore:
                     (ntype, name, json.dumps(attrs, ensure_ascii=False)))
                 if key not in name_index[name]:
                     name_index[name].append(key)
+
+            # 关系中文名与节点/关系同在一个事务里落库：
+            # 中途失败不会留下「有边没中文名」的半成品。
+            # ⚠️ **数据优先于代码**：CSV 里给了中文名就登记，哪怕静态表里也有。
+            # 静态表是「无数据时的兜底」，而 CSV 是用户实际维护的那份真相——
+            # 用户在自己的图谱里把 part_of 译成别的，不该被代码里的旧译名盖回去。
+            # （原神图谱的 CSV 没有 rel_cn 列，故一个关系都不会登记，
+            #  导出仍是三列，这个约定不受影响。）
+            for rel, cn in rel_cn_map.items():
+                if rel in self._rel_cn:
+                    continue      # 先导入的表优先，不被后来的覆盖
+                self._conn.execute(
+                    'INSERT OR REPLACE INTO kg_rel_names (rel, cn) VALUES (?, ?)',
+                    (rel, cn))
+                self._rel_cn[rel] = cn
+                report['rel_cn_added'] += 1
 
             for n1, rel, n2, hints, weight in rel_rows:
                 k1 = self._import_endpoint(n1, hints, name_index, report)
@@ -1006,6 +1126,8 @@ class KGStore:
         - 关系按真实方向写入文件名（如 地区→国家 导出为 ``rel-area-country.csv``）；
         - **带权重的关系表会多写一列 weight**（全部是默认权重时不写，保持与
           旧版导出逐字节一致，不给下游 diff 制造噪声）；
+        - **库里有登记的关系表会多写一列 rel_cn**（同样按需出现），
+          使关系中文名随数据往返，而不是只能来自代码里的静态字典；
         - 实体表 label 列写中文名（若有）而非类型键——这正是 csv-edu 的形态，
           写类型键会丢掉全部中文名；无中文名时仍写类型键，兼容原神数据。
         - 动态注册的类型（``ai`` / ``education`` 等）与内置类型一视同仁导出。
@@ -1052,13 +1174,25 @@ class KGStore:
             path = os.path.join(out_dir, f'rel-{st}-{dt}.csv')
             # 只有该表内存在非默认权重时才加 weight 列
             has_weight = any(w != DEFAULT_WEIGHT for _, _, _, w in triples)
+            # 同理，关系中文名只在**库里真的登记过**时才写。
+            # ⚠️ 不能对所有关系都写中文名：无登记时写出英文原文当「中文名」，
+            # 会让回灌方以为那串英文就是中文，反而污染数据。
+            # 也因此，原神图谱（全部关系走静态 REL_NAMES）导出仍是三列。
+            # ⚠️ triples 的元素顺序是 (名1, 关系, 名2, 权重)——关系在**下标 1**，
+            # 取错位置会拿节点名去查字典（恒查不到，导出就少一列）。
+            cn_of = {rel for _n1, rel, _n2, _w in triples if rel in self._rel_cn}
             with open(path, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['node1', 'rel', 'node2']
-                                + (['weight'] if has_weight else []))
+                                + (['weight'] if has_weight else [])
+                                + (['rel_cn'] if cn_of else []))
                 for n1, rel, n2, w in triples:
-                    writer.writerow([n1, rel, n2]
-                                    + ([self._fmt_weight(w)] if has_weight else []))
+                    row = [n1, rel, n2]
+                    if has_weight:
+                        row.append(self._fmt_weight(w))
+                    if cn_of:
+                        row.append(self._rel_cn.get(rel, ''))
+                    writer.writerow(row)
             edge_files += 1
             edge_rows += len(triples)
             if has_weight:

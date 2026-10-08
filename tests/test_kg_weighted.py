@@ -11,6 +11,7 @@
 """
 
 import csv
+import glob
 import os
 
 import pytest
@@ -27,13 +28,74 @@ pytestmark = pytest.mark.skipif(
     reason='需要 data/csv-edu 样本数据（带权重的边 + 新类型节点）')
 
 
-@pytest.fixture(scope='module')
-def edu(tmp_path_factory):
-    """导入了 csv-edu 全部数据的图谱（532 实体 / 681 关系，关系全部带权重）。"""
-    db = tmp_path_factory.mktemp('edu') / 'kg.db'
-    store = KGStore(str(db), auto_seed=False)
+@pytest.fixture
+def edu(tmp_path):
+    """导入了 csv-edu 全部数据的图谱。
+
+    ⚠️ **必须是 function 级**：导入外部图谱会往模块级全局 ``NODE_TYPES``
+    注册 ``ai`` / ``education`` 等类型，而 tests/conftest.py 的 autouse
+    fixture 会在**每个测试进场前**把该全局恢复成 12 种内置类型（否则
+    test_kg_store 的 ``node_files == len(NODE_TYPES)`` 会被污染成 21 而失败，
+    且只在全量跑时暴露）。若本fixture 是 module 级，就只在第一个测试前
+    注册一次，之后每个测试进场前都被擦掉，本文件里断言
+    ``'ai' in NODE_TYPES`` 的用例反而会挂。故改成每次重建。
+    """
+    store = KGStore(str(tmp_path / 'kg.db'), auto_seed=False)
     store.import_csv(EDU_DIR)
     return store
+
+
+def csv_entity_count():
+    """label-*.csv 的实体行数（**现算**，不写死数字）。
+
+    ⚠️ 这些断言原先硬编码 532 / 681，csv-edu 数据一扩充就全红，
+    而失败信息只说「532 != 732」，看不出是数据变了还是功能坏了。
+    改成从 CSV 现算：数据更新后测试自动跟着走，仍能守住
+    「导入的实体数等于 CSV 里的实体数」这个真正的契约。
+    """
+    total = 0
+    for path in glob.glob(os.path.join(EDU_DIR, 'label-*.csv')):
+        with open(path, encoding='utf-8-sig', newline='') as f:
+            total += sum(1 for row in csv.DictReader(f)
+                         if (row.get('name') or '').strip())
+    return total
+
+
+def csv_rel_count():
+    """rel-*.csv 的关系行数（同样现算）。"""
+    total = 0
+    for path in glob.glob(os.path.join(EDU_DIR, 'rel-*.csv')):
+        with open(path, encoding='utf-8-sig', newline='') as f:
+            total += sum(1 for row in csv.DictReader(f)
+                         if (row.get('rel') or '').strip())
+    return total
+
+
+def csv_count_by_type():
+    """各类型的实体数 {类型: 个数}，从 label-*.csv 现算。"""
+    counts = {}
+    for path in glob.glob(os.path.join(EDU_DIR, 'label-*.csv')):
+        ntype = os.path.basename(path)[len('label-'):-len('.csv')]
+        with open(path, encoding='utf-8-sig', newline='') as f:
+            counts[ntype] = sum(1 for row in csv.DictReader(f)
+                                if (row.get('name') or '').strip())
+    return counts
+
+
+def csv_weighted_rel_files():
+    """源目录里带 weight 列的关系表数量。
+
+    ⚠️ **不能**用它断言导出报告的 ``weighted_files``：导出按「库里的真实
+    方向」重新分组（``rel-<源类型>-<目标类型>.csv``），方向组合数与源文件数
+    本来就不相等（实测源目录 6 个表 → 导出 14 个）。两者不是同一个量。
+    """
+    n = 0
+    for path in glob.glob(os.path.join(EDU_DIR, 'rel-*.csv')):
+        with open(path, encoding='utf-8-sig', newline='') as f:
+            fields = [c.strip().lower() for c in next(csv.reader(f))]
+        if any(c in fields for c in ('weight', '权重', '权重值', 'strength', '置信度')):
+            n += 1
+    return n
 
 
 # ---------- 导入：新类型 + 带权重的边 ----------
@@ -46,10 +108,16 @@ def test_edu_nodes_imported(edu):
     整表被丢弃，进而 681 条关系全部因端点不存在而跳过。
     """
     stats = edu.stats()
-    assert stats['nodes'] == 532
-    assert stats['edges'] == 681
-    assert stats['by_type']['ai'] == 211
-    assert stats['by_type']['education'] == 321
+    assert stats['nodes'] == csv_entity_count()
+    assert stats['edges'] == csv_rel_count()
+    # 每种类型的实体数合计应等于实体总数。
+    # ⚠️ 不能逐类型断言「by_type[X] == label-X.csv 行数」：关系表里出现、
+    # 但实体表没收录的端点会**自动补桩**（如 ArangoDB / JanusGraph 等
+    # 图数据库名各补 1 个），于是 database 的 187 行会变成 181+6 个桩。
+    # 桩是既有设计（见 _import_endpoint），不是丢数据，故只断言总数守恒。
+    assert sum(stats['by_type'].values()) == stats['nodes']
+    # CSV 里声明的类型必须都在（不能被静默丢弃）
+    assert set(csv_count_by_type()) <= set(stats['by_type'])
 
 
 def test_new_types_registered(edu):
@@ -88,8 +156,8 @@ def test_search_finds_by_chinese_name(edu):
 def test_edu_edges_have_weights(edu):
     """关系表里的 weight 列必须读进来（而不是被当成普通属性丢掉）。"""
     stats = edu.stats()
-    assert stats['edges'] == 681
-    assert stats['weighted_edges'] == 681      # 全部带权重
+    assert stats['edges'] == csv_rel_count()
+    assert stats['weighted_edges'] == stats['edges']   # 全部带权重
     # 方向无关地取权重：UI 只知道「A — 关系 — B」
     assert edu.edge_weight(('ai', 'instruction tuning'), 'derived_from',
                            ('ai', 'foundation model')) == 8.0
@@ -107,7 +175,7 @@ def test_weight_persists_across_instances(tmp_path):
     store.close()
 
     reopened = KGStore(db, auto_seed=False)
-    assert reopened.stats()['weighted_edges'] == 681
+    assert reopened.stats()['weighted_edges'] == csv_rel_count()
     assert reopened.edge_weight(('ai', 'RLHF'), 'part_of',
                                 ('ai', 'post-training')) == 9.0
 
@@ -152,15 +220,22 @@ def test_edu_export_roundtrip_lossless(edu, tmp_path):
     """导出后整目录回灌：节点/关系/权重/中文名全部一致。"""
     out = str(tmp_path / 'edu_out')
     report = edu.export_csv(out)
-    assert report['node_rows'] == 532
-    assert report['edge_rows'] == 681
-    assert report['weighted_files'] == 3      # 三个 rel 表都带权重
-    assert report['weighted_rows'] == 681
+    assert report['node_rows'] == csv_entity_count()
+    assert report['edge_rows'] == csv_rel_count()
+    # csv-edu 的关系全部带权重，故导出的每个 rel 表都该有 weight 列，
+    # 且带权重的行数 = 关系总数（分组后的文件数与源文件数无关，见上面的说明）
+    assert report['weighted_rows'] == csv_rel_count()
+    exported_rel = glob.glob(os.path.join(out, 'rel-*.csv'))
+    assert report['weighted_files'] == len(exported_rel)
+    for path in exported_rel:
+        with open(path, encoding='utf-8-sig') as f:
+            header = f.readline()
+        assert 'weight' in header, f'{os.path.basename(path)} 缺 weight 列'
 
     clone = KGStore(str(tmp_path / 'clone.db'), auto_seed=False)
     rep = clone.import_csv(out, replace=True)
-    assert rep['nodes_added'] == 532
-    assert rep['edges_added'] == 681
+    assert rep['nodes_added'] == csv_entity_count()
+    assert rep['edges_added'] == csv_rel_count()
     assert rep['edges_skipped'] == 0
     assert clone.stats()['nodes'] == edu.stats()['nodes']
     assert clone.stats()['edges'] == edu.stats()['edges']

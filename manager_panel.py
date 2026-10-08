@@ -40,6 +40,17 @@ from kg_view import KGCanvas
 APP_VERSION = '3.8.2'
 REPO_URL = 'https://github.com/MrYuPengfei/Pilot-KG-Genshin.git'
 
+
+def rel_label(kg, rel):
+    """关系的中英并列标签，如 ``衍生自 derived_from``。
+
+    中文名走 :meth:`KGStore.rel_cn_of`——库里登记过的优先（外部图谱的关系名
+    随CSV 来），静态 :data:`REL_NAMES` 只作兜底。
+    中英相同时（用户自建关系名恰好就是中文）不重复显示。
+    """
+    cn = kg.rel_cn_of(rel) if kg is not None else rel_cn(rel)
+    return cn if cn == rel else f'{cn} {rel}'
+
 # 全局按钮尺寸：管理面板**所有页**的按钮一律用这个尺寸，保证视觉一致。
 # 必须显式 setFixedSize——同一行的 QPushButton 默认 sizePolicy 会被拉伸成等宽，
 # 文字长短仍会让观感不一致（v3.7 逐页统一时踩过）。
@@ -439,8 +450,9 @@ class ManagerPanel(QMainWindow):
         self.kg_legend = legend
 
         hint = QLabel('单击节点查看详情，双击节点以其为中心展开，滚轮缩放、拖拽平移；'
-                      '右侧可编辑实体与关系。边越粗表示权重越高，'
-                      '节点下方小字为中文名（支持中文搜索）')
+                      '右侧可编辑实体与关系。节点标签为「英文名 + 中文名」，'
+                      '边标签为「关系中文名 + 英文名」，边越粗表示权重越高'
+                      '（支持中文搜索）')
         hint.setStyleSheet('color: #7f8c8d;')
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -573,6 +585,8 @@ class ManagerPanel(QMainWindow):
     def _kg_fill_relations(self, key):
         """把当前实体有向关系填进列表：出边显示「关系 → 对端」，入边显示「对端 → 关系」。
 
+        关系名**中英并列**（``衍生自 derived_from``）：csv-edu 这类外部图谱的
+        关系名是英文，只显示中文会认不出是哪一条关系。
         有权重的关系在末尾标出权重（``· 8``），默认权重不标——否则整屏都是
         重复的「· 1.0」，真正带权的那几条反而被淹掉。
         """
@@ -585,8 +599,9 @@ class ManagerPanel(QMainWindow):
             label = other[1] + (f'（{cn}）' if cn else '')
             w_mark = '' if weight == DEFAULT_WEIGHT else \
                 f'  · {int(weight) if float(weight).is_integer() else weight}'
+            # 库里登记过的中文名优先（rel_cn_of），静态表只作兜底
             self.kg_rel_list.addItem(
-                f'{rel_cn(rel)} {arrow} {label}  [{o_type}]{w_mark}')
+                f'{rel_label(self.kg, rel)} {arrow} {label}  [{o_type}]{w_mark}')
             self._kg_rel_edges.append((rel, other, direction))
         self.kg_rel_list.blockSignals(False)
         if not self._kg_rel_edges:
@@ -756,9 +771,10 @@ class ManagerPanel(QMainWindow):
         if anchor is None or selected is None or not self._ensure_kg_loaded():
             return
         rel, other, _direction = selected
+        label = rel_label(self.kg, rel)
         ret = QMessageBox.question(
             self, '确认删除',
-            f'确定删除关系「{rel_cn(rel)}」吗？\n{anchor[1]} — {rel_cn(rel)} — {other[1]}')
+            f'确定删除关系「{label}」吗？\n{anchor[1]} — {label} — {other[1]}')
         if ret != QMessageBox.StandardButton.Yes:
             return
         self.kg.delete_edge_touching(anchor, rel, other)
