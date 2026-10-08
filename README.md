@@ -1,4 +1,8 @@
 # 原神-桌面伙伴
+## 安装包和第知识图谱数据
+通过网盘分享的文件：3.8.3
+链接: https://pan.baidu.com/s/1xeWh20HxcCA420cVye4A5g?pwd=5tuv 提取码: 5tuv
+
 
 ## 项目名称Pilot-KG-Genshin
 
