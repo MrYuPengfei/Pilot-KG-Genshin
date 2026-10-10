@@ -1,1000 +1,897 @@
+# -*- coding: utf-8 -*-
+"""米哈游「原神」资料站（ys_obc）爬虫 —— 图鉴素材 + 知识图谱。
+
+数据源
+------
+站点早就不是老脚本里那个 ``content/info`` 单打独斗的路子 了，实测可用的是
+**频道树列表**接口，一次请求就能拿到整个频道的条目元数据：
+
+    GET https://api-static.mihoyo.com/common/blackboard/ys_obc/v1/home/content/list
+        ?app_sn=ys_obc&channel_id=<频道>
+
+``data.list[0].children`` 是频道树（30 个频道，含角色/武器/圣遗物/敌人/食物/
+秘境/组织/书籍…），每个叶子频道的 ``list`` 给出该频道**全部**条目，每条含：
+
+===============  ==========================================================
+``content_id``   条目 id（用于抓详情页）
+``title``        中文名
+``icon``         图标 URL（**同时是图片素材本身**）
+``ext``          JSON 字符串，内含 ``c_<频道>.filter.text``：
+                 形如 ``["地区/蒙德","星级/五星","元素/岩","武器/单手剑"]``
+                 的**结构化筛选条件**——这是知识图谱关系的主要来源
+``summary``      一句话简介
+===============  ==========================================================
+
+条目详情页（``content/info``）只对 ``content_id < 500000`` 的老条目有效；
+5.x 之后的新条目（约占角色的一半）由另一套 wiki 后端承载，``content/info``
+一律返回 ``retcode=-2010 内容不存在``。因此本模块**以列表接口为主**，
+详情页只作为可选的补充（``--detail``），不作为数据链路的必需环节。
+
+版本区间（1.1 ~ 7.1）
+--------------------
+接口**不提供**结构化的版本字段。可用的版本线索只有三处，且都不可靠：
+
+1. ``summary``/``title`` 里偶发的「X.Y版本」字样——只覆盖约 3% 条目；
+2. 详情页 ``ctime``（条目创建时间）——与上线版本**大体**吻合
+   （钟离 ctime 2020-12-01 / v1.1，甘雨 2021-01-12 / v1.2），但 wiki
+   条目会因改版被重建，**不精确**；
+3. ``icon`` URL 里的日期段——2021 年那波全站图标重传把 38/72 个老角色的
+   日期刷成了 2021，**完全不可用于判版本**。
+
+所以本模块的做法是：把版本区间当成**时间窗**而不是精确版本号——
+用 :data:`VERSION_DATES` 的升序表把 ``ctime`` 映射到「该日期当时所处的
+版本」，得到一个 ``version_estimate`` 字段，并**同时保留 ctime 原值**
+供人工核对。筛版本时只按这个估计值筛，不假装它是精确的上线版本。
+
+产出
+----
+默认写到 ``data/spider-data``：
+
+======================  ==================================================
+``images/<类型>/``      条目图标（``title`` + content_id 命名，去重安全）
+``csv/label-<类型>.csv``  实体表，表头与 ``kg_store`` 的导入约定一致
+                        （``name`` / ``name_cn`` / ``label`` / ``label_cn``）
+``csv/rel-*.csv``        关系表，表头 ``node1,rel,node2,rel_cn``
+``manifest.json``        抓取清单：条目数、版本分布、失败 id、耗时
+======================  ==================================================
+
+``csv/`` 目录可以直接被 :meth:`kg_store.KGStore.import_csv` 整目录导入。
+
+用法
+----
+::
+
+    python tools/mihoyo_spider.py                      # 默认 1.1~7.1 全频道
+    python tools/mihoyo_spider.py --from-version 5.0    # 只要 5.0 之后
+    python tools/mihoyo_spider.py --no-images          # 只出图谱，不下图
+    python tools/mihoyo_spider.py --channels 25 5 218  # 只抓指定频道
+    python tools/mihoyo_spider.py --limit 20 --dry-run # 试跑，不写盘
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
 import json
 import os
 import re
+import sys
 import time
-import pandas as pd
-import requests
-# -*- coding:utf-8 -*-
-# coding=gb2312
+import unicodedata
+from collections import Counter, defaultdict
+
+try:
+    import requests
+except ImportError:                                    # pragma: no cover
+    sys.exit('缺少依赖 requests，请先 pip install requests')
+
+# --------------------------------------------------------------------------
+# 常量
+# --------------------------------------------------------------------------
+
+API_HOST = 'https://api-static.mihoyo.com/common/blackboard/ys_obc/v1'
+LIST_URL = API_HOST + '/home/content/list'
+INFO_URL = API_HOST + '/content/info'
+
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              ' (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36')
+
+#: 默认输出根目录（相对仓库根）。素材与图谱都落在这里。
+DEFAULT_OUT_DIR = os.path.join('data', 'spider-data')
+
+#: ``content_id`` 高于此值即进入新版 wiki 后端，``content/info`` 抓不到详情。
+#: 仍然会尝试（少数会成功），但默认只在 ``--detail`` 时才发这些请求。
+NEW_WIKI_ID_THRESHOLD = 500000
+
+#: 版本 → 上线日期。**升序**，用于把 ctime 映射到「当时所处版本」。
+#:
+#: 1.0 之前（无相性系统）与测试版本不列入；本表止于 7.1（2026-09-23 上线，
+#: 即当前线上版本）。6.x 另有「月之版本」并行的月版本编号（6.0 = 月之一），
+#: 这里统一用 6.x 主线编号。
+VERSION_DATES = [
+    ('1.0', '2020-09-28'), ('1.1', '2020-11-11'), ('1.2', '2020-12-23'),
+    ('1.3', '2021-02-03'), ('1.4', '2021-03-17'), ('1.5', '2021-04-28'),
+    ('1.6', '2021-06-09'), ('2.0', '2021-07-21'), ('2.1', '2021-09-01'),
+    ('2.2', '2021-10-13'), ('2.3', '2021-11-24'), ('2.4', '2022-01-05'),
+    ('2.5', '2022-02-16'), ('2.6', '2022-03-30'), ('2.7', '2022-05-31'),
+    ('2.8', '2022-07-13'), ('3.0', '2022-08-24'), ('3.1', '2022-09-28'),
+    ('3.2', '2022-11-02'), ('3.3', '2022-12-07'), ('3.4', '2023-01-18'),
+    ('3.5', '2023-03-01'), ('3.6', '2023-04-12'), ('3.7', '2023-05-24'),
+    ('3.8', '2023-07-05'), ('4.0', '2023-08-16'), ('4.1', '2023-09-27'),
+    ('4.2', '2023-11-08'), ('4.3', '2023-12-20'), ('4.4', '2024-01-31'),
+    ('4.5', '2024-03-13'), ('4.6', '2024-04-24'), ('4.7', '2024-06-05'),
+    ('4.8', '2024-07-17'), ('5.0', '2024-08-28'), ('5.1', '2024-10-09'),
+    ('5.2', '2024-11-20'), ('5.3', '2025-01-01'), ('5.4', '2025-02-12'),
+    ('5.5', '2025-03-26'), ('5.6', '2025-05-07'), ('5.7', '2025-06-18'),
+    ('5.8', '2025-07-30'), ('6.0', '2025-09-10'), ('6.1', '2025-10-22'),
+    ('6.2', '2025-12-03'), ('6.3', '2026-01-14'), ('6.4', '2026-02-25'),
+    ('6.5', '2026-04-08'), ('6.6', '2026-05-20'), ('6.7', '2026-07-01'),
+    ('7.0', '2026-08-12'), ('7.1', '2026-09-23'),
+]
+
+#: 频道 id → (实体类型键, 类型中文名, 该频道要抽的关系名)。
+#:
+#: 关系名的选择对齐 ``kg_store.REL_NAMES`` / ``data/csv`` 的既有约定，
+#: 这样 ``data/spider-data/csv`` 与 ``data/csv`` 里的老图谱能对上号。
+CHANNELS = {
+    25:  ('character', '人物', ['元素', '武器', '地区', '神之眼所属', '星级']),
+    5:   ('weapon', '武器', ['武器类型', '武器星级', '获取途径']),
+    218: ('artifacts', '圣遗物', ['获取方式', '星级']),
+    6:   ('master', '怪物', ['元素', '类型']),
+    21:  ('food', '料理', ['食物类型', '食物获取方式', '食物星级']),
+    54:  ('instance', '副本', ['秘境类型', '推荐元素']),
+    255: ('organization', '组织', ['地区']),
+    68:  ('book', '书籍', ['书籍类型', '获取方式']),
+}
+
+#: 抽取「值」型筛选条件时，这些键产出的是**节点**（要参与关系），
+#: 其余键（如「特殊机制」）只作为实体属性写进 CSV，不建节点。
+#:
+#: ⚠️ 关系名与 ``kg_store.REL_NAMES`` 对齐（同名同义），这样
+#: ``data/spider-data/csv`` 与 ``data/csv`` 的老图谱能对上号。
+#:
+#: ⚠️ 「地区」在角色频道是**城市**（蒙德城/璃月港），在组织频道却是
+#: **国家**（蒙德/璃月）——同名不同义，故角色侧另立 ``area`` 类型，
+#: 不与国家混用，否则「蒙德城」会被当成国家。
+VALUE_KEYS = {
+    '元素': ('element', 'element_is', '元素'),
+    '武器': ('weapon_type', 'weapon_is', '使用武器'),
+    '武器类型': ('weapon_type', 'weapon_type_is', '武器类型'),
+    '地区': ('area', 'located_in', '所在地区'),
+    '秘境类型': ('instance_type', 'instance_type_is', '秘境类型'),
+    '推荐元素': ('element', 'recommend_element', '推荐元素'),
+    '类型': ('enemy_type', 'enemy_type_is', '敌人类型'),
+    # 「神之眼所属」取值是蒙德/璃月…，但也有「愚人众」这种**势力**，
+    # 混进国家会让「愚人众」变成一个国家，故单列 faction 类型。
+    '神之眼所属': ('faction', 'affiliated_with', '所属势力'),
+}
+
+#: 「值」里需要丢弃的占位项——它们不是有意义的实体。
+PLACEHOLDERS = {'未知', '无', '其他', '跨国家', '是', '否'}
+
+#: 这些频道的「地区」筛选值是**国家/地区**级（蒙德/璃月/…/挪德卡莱/跨国家），
+#: 与角色频道的城市级「地区」语义不同，故按国家口径建节点。
+#: 键是 :data:`CHANNELS` 里的**类型键**。
+COUNTRY_KEYS = {'organization': '地区'}
+
+#: 组织频道的地区值 → 规范国家名。挪德卡莱/至冬都是地区而非七国之一，
+#: 但图鉴里就是按国家粒度记的，保留原名即可。
+COUNTRY_CANON = {
+    '蒙德': '蒙德', '璃月': '璃月', '稻妻': '稻妻', '须弥': '须弥',
+    '枫丹': '枫丹', '纳塔': '纳塔', '至冬': '至冬', '挪德卡莱': '挪德卡莱',
+}
+
+#: 关系名 → 中文名，写进 rel-*.csv 的 ``rel_cn`` 列。
+#: 与 ``kg_store.REL_NAMES`` 同名同义，避免导入后出现两套中文名。
+REL_CN = {
+    'element_is': '元素',
+    'recommend_element': '推荐元素',
+    'weapon_is': '使用武器',
+    'weapon_type_is': '武器类型',
+    'located_in': '位于',
+    'part_of': '属于',
+    'affiliated_with': '所属势力',
+    'instance_type_is': '秘境类型',
+    'enemy_type_is': '敌人类型',
+    'special_food': '特殊料理',
+    'ingredient_is': '原料',
+    'drop_from': '掉落',
+    'obtainable_from': '获取途径',
+    'versioned_in': '上线版本',
+}
+
+#: 文件名安全化：Windows 禁止 ``\ / : * ? " < > |``，另加控制字符。
+_UNSAFE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
+# --------------------------------------------------------------------------
+# 工具函数
+# --------------------------------------------------------------------------
 
-false = null = true = ''
-
-
-class MiHoYoSpider():
-
-    def __init__(self):
-        self.url = 'https://api-static.mihoyo.com/common/blackboard/ys_obc/v1/content/info?app_sn=ys_obc&content_id='
-        self.path = 'your save path'
-        self.id = 'id list for spider'
-
-    def parse(self):
-        """
-        code for parsing html
-        need to rewrite it
-        """
-        pass
-
-    def clear(self):
-        """
-        code for clearing csv file
-        need to rewrite it
-        """
-        pass
+def safe_filename(name, fallback='unnamed', max_len=80):
+    """把实体名转成安全的文件名（保留中文，截断到 max_len）。"""
+    text = unicodedata.normalize('NFC', str(name or '')).strip()
+    text = _UNSAFE.sub('_', text).rstrip('. ')
+    if len(text) > max_len:
+        text = text[:max_len]
+    return text or fallback
 
 
-class CharacterSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.char_id = list(pd.read_csv('../rec_intention/kg_data/mhy-id/character-id.csv')['mhy_id'])
-        self.path = '../rec_intention/kg_data/to_do/label-character.csv'
-
-    def parse(self):
-        for i in self.char_id:
-            url = self.url + str(i)
-            res = requests.get(url)
-            if res.status_code == 200:
-                res = eval(res.text)
-                data = eval(str(res['data']['content']).replace('\\n', ''))
-                # pprint.pprint(data)
-                role_name = data['title']
-                info = eval(data['ext'])["c_25"]["filter"]["text"]
-                icon = data['icon']
-                summary = data['summary']
-                html1 = data['contents'][0]['text']
-                shown = data['contents'][2]['text']
-                # pprint.pprint(shown)
-                txt = [re.sub('<(.*?)>', '', str(i)) for i in
-                       re.findall('style="white-space: pre-wrap;">(.*?)</p><p ', shown)]
-                with open('../rec_intention/yuanshen.txt', 'a+') as f:
-                    [f.write(i + '\n') for i in txt]
-                # pprint.pprint(txt)
-                # break
-                # introduce = re.findall('class="obc-tmp-character__value">(.*?)</div></div>', html1)
-                # broken = re.findall(
-                #     'class="obc-tmpl__icon-text">([\u4e00-\u9fa5]+)</span></a> <span class="obc-tmpl__icon-num">(\*[\d]+)</span>',
-                #     html1)
-                # desc = re.findall('pre-wrap;">(.*?)</p></td>', html1)
-                # attr = re.findall('pre-wrap; text-align: center;">(.*?)</p>', html1)
-                # weapons = re.findall(
-                #     'alt="" class="obc-tmpl__icon"><span class="obc-tmpl__icon-text">([\u4e00-\u9fa5]+)</span></a> <!----></div></td>',
-                #     html1)
-                # html2 = data['contents'][1]['text']
-                # attack = re.findall('class="obc-tmpl__icon-text">(.*?)</span> ', html2)
-                # skill_desc = re.findall('obc-tmpl__pre-text">(.*?)</pre>', html2)
-                # live_desc = re.findall('<td>(.*?)</td></tr><tr><td><div', html2)
-                # skill_book = re.findall(
-                #     '<span class="obc-tmpl__icon-text">([\u4e00-\u9fa5「」]+)</span></a> <span class="obc-tmpl__icon-num">(\*[\d]+)</span></div></div><div>',
-                #     html2)
-                # mz_desc = [i for i in attack if 'span' not in i and 'class' not in i]
-                # mz_effect = [i for i in live_desc if 'span' not in i and 'class' not in i]
-                # print(f'{i}:{role_name}')
-                # df = pd.DataFrame(data=[{'编号': i, '名字': role_name, '介绍': info, '图片': icon, '总结': summary,
-                #                          '信息': introduce, '突破材料': broken, '武器选择': desc, '圣遗物': attr, '武器': weapons,
-                #                          'skill_book': skill_book, '命座描述': mz_desc, '技能描述': skill_desc,
-                #                          '命座': mz_effect}])
-                #
-                # if os.path.exists(self.path):
-                #     df.to_csv(self.path, mode='a', index=False, header=False, encoding='utf-8')
-                # else:
-                #     df.to_csv(self.path, index=False, encoding='utf-8')
-                time.sleep(2)
-
-    def clear(self):
-        pass
+def version_tuple(text):
+    """``'7.1'`` → ``(7, 1)``；解析不出来返回 ``(0, 0)``（排在最前）。"""
+    m = re.match(r'\s*(\d+)\.(\d+)', str(text or ''))
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-class MasterSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.master_id = list(pd.read_csv('../rec_intention/kg_data/mhy-id/master-id.csv')['mhy_id'])
-        self.path = '../rec_intention/kg_data/to_do/label-master.csv'
+def version_from_date(date_str):
+    """把日期映射到「该日期当时所处的版本」。
 
-    def parse(self):
-        for i in self.master_id:
-            url = 'https://api-static.mihoyo.com/common/blackboard/ys_obc/v1/content/info?app_sn=ys_obc&content_id=' + str(
-                i)
-            res = requests.get(url)
-            if res.status_code == 200:
-                html = eval(res.text.replace('\\n', ''))
-                # pprint.pprint(html)
-                contents = html['data']['content']['contents'][0]['text']
-                name = html['data']['content']['title']
-                id = html['data']['content']['id']
-                dropping = [i for i in re.findall('<p class="obc-tmpl__material-name">(.*?)</p> ', contents) if
-                            len(i) < 50]
-                attack = [i for i in re.findall('pre-wrap;">(.*?)</p></td></tr><tr><td ', contents) if len(i) < 50]
-                element = [i for i in re.findall('style="">(.*?)</p></td></tr><tr><td ', contents) if len(i) < 50]
-                method = [i for i in re.findall('<li><p style="white-space: pre-wrap;">(.*?)</p></li>', contents) if
-                          len(i) < 50]
-                backstory = [i for i in re.findall('pre-wrap;">(.*?)</p>', contents) if
-                             i not in method and i not in attack and '注：' not in i]
-                print(id, name)
-                df = pd.DataFrame(
-                    data=[{'id': id, 'name': name, 'dropping': dropping, 'attack': attack, 'element': element,
-                           'method': method, 'backstory': backstory}])
-                if os.path.exists('../rec_intention/kg_data/master2.csv'):
-                    df.to_csv('../rec_intention/kg_data/master2.csv', mode='a', index=False, header=False,
-                              encoding='utf-8')
-                else:
-                    df.to_csv('../rec_intention/kg_data/master2.csv', index=False, encoding='utf-8')
-            time.sleep(2)
+    做法是在 :data:`VERSION_DATES` 里找**最后一个不晚于该日期**的版本。
+    早于 1.0 的返回 ``'1.0-'``（表示「早于有版本号的历史」，排最前）；
+    晚于 7.1 的返回 ``'7.1+'``。
 
-    def clear(self):
-        df = pd.read_csv('../rec_intention/kg_data/master.csv')
-
-        def get_ele(attack):
-            attack = eval(attack)
-            e, a = '无', []
-            if attack:
-                if attack[0] in ['无', '风', '火', '水', '岩', '雷', '冰', '物理', '草']:
-                    e = attack[0]
-                attack.remove(attack[0])
-                a = attack
-            return e
-
-        df['element'] = df.apply(lambda x: get_ele(x['attack']), axis=1)
-        df['attack'] = df['attack'].apply(
-            lambda x: str([i for i in eval(x) if i not in ['无', '风', '火', '水', '岩', '雷', '冰', '物理', '草']]))
-
-        df.to_csv('../rec_intention/kg_data/done/label-master.csv', index=False, encoding='utf-8')
-        print(df[['element', 'attack']])
+    ⚠️ 这是**估计值**，不是精确上线版本——wiki 条目 ctime 会被改版重建。
+    调用方应把它当时间窗用，别当权威来源。
+    """
+    if not date_str:
+        return ''
+    day = str(date_str)[:10].replace('/', '-')
+    if not re.match(r'\d{4}-\d{2}-\d{2}', day):
+        return ''
+    picked = ''
+    for ver, date in VERSION_DATES:
+        if date <= day:
+            picked = ver
+        else:
+            break
+    return picked or '1.0-'
 
 
-class FoodSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.food_id = list(pd.read_csv('../rec_intention/kg_data/mhy-id/food-id.csv')['mhy_id'])
-        self.path = '../rec_intention/kg_data/to_do/label-food.csv'
+def extract_ctime(content):
+    """从详情页 payload 里取 ``ctime`` 的日期部分。"""
+    raw = (content or {}).get('ctime') or ''
+    return str(raw)[:10].replace('/', '-')
 
-    def parse(self):
-        for i in [2455, 2567, 2607, 2762, 2763, 2764, 2765, 2766, 2767, 2768, 2769, 2770, 2771, 2772, 2775, 2824, 2854,
-                  2855, 2873, 2876, 3051, 3052, 3053, 3054, 3055, 3056, 3057, 3058, 3059, 3060, 3061, 3062, 3164, 3165,
-                  3166, 3379, 3426, 3530, 3567, 3577, 3654, 3865, 3914, 3964, 4338, 4339, 4387, 4388, 4389, 4390, 4538,
-                  4539, 4608, 4635, 4636, 4637, 4638, 4639, 4640, 4755, 4863, 4893, 4894, 4895, 4896, 4897, 4898]:
-            try:
-                foods = []
-                url = 'https://api-static.mihoyo.com/common/blackboard/ys_obc/v1/content/info?app_sn=ys_obc&content_id=' + str(
-                    i)
-                res = requests.get(url)
-                if res.status_code == 200:
-                    data = eval(res.text)['data']['content']
-                    try:
-                        food_desc = eval(data['ext'])['c_21']['filter']['text']
 
-                    except:
-                        food_desc = []
-                    text = data['contents'][0]['text']
-                    # pprint.pprint(data)
-                    name = re.findall('名称：(.*?)<', text)
+def parse_filter(ext_text):
+    """把 ``ext`` 里 ``c_<频道>.filter.text`` 解析成 ``[(键, 值), ...]``。
 
-                    try:
-                        material = re.findall('class="obc-tmpl__icon-text">([\u4e00-\u9fa5]+)</span></a> <span ', text)
-                        num = re.findall(r'class="obc-tmpl__icon-num">(\*\d+)</span></div>', text)
-                    except:
-                        material, num = [], []
-                    descs = re.findall('描述：(.*?)<', text)
-                    effect = re.findall('使用效果：(.*?)<', text)
-                    get_method = re.findall('获得方式：(.*?)<', text)
-                    food_map = re.findall('食谱获得：(.*?)</p>', text)
-                    print(i, name)
-                    # print(name,material,num,descs,effect,get_method,food_map)
-                    # foods.append(
-                    #     {'food_id': i, 'info': food_desc, 'name': name, 'material': material, 'num': num,'descs':descs,
-                    #                        'effect':effect,'method':get_method,'get':food_map})
-                    mat_num = list(set([material[i] + num[i] for i in range(len(num))]))
-                    for k in range(len(name)):
-                        foods.append({'food_id': i, 'info': food_desc, 'name': name[k], 'material': str(mat_num),
-                                      'desc': descs[k],
-                                      'effect': effect[k], 'method': get_method[k], 'get': food_map[k]})
+    ``filter.text`` 本身是 JSON 数组字符串（**不是** Python 字面量），
+    形如 ``["地区/蒙德","星级/五星"]``。旧脚本用 ``eval`` 解析它，
+    换成 ``json`` 后不必再担心 ``null``/``true`` 之类 Python 专有字面量。
 
-                    df = pd.DataFrame(foods)
-                    if os.path.exists('../rec_intention/kg_data/food.csv'):
-                        df.to_csv('../rec_intention/kg_data/food.csv', mode='a', index=False, header=False,
-                                  encoding='utf-8')
-                    else:
-                        df.to_csv('../rec_intention/kg_data/food.csv', index=False, encoding='utf-8')
-
-            except Exception as e:
-                print(i)
+    只取第一个 ``/``：值本身可以含 ``/``（如 ``原粹树脂*20``、
+    ``蒙徳/蒙德城``），用 ``split('/', 1)`` 而不是无脑 split。
+    """
+    if not ext_text:
+        return []
+    try:
+        ext = json.loads(ext_text)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(ext, dict):
+        return []
+    for block in ext.values():
+        if not isinstance(block, dict):
+            continue
+        text = (block.get('filter') or {}).get('text')
+        if not text:
+            continue
+        try:
+            items = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        pairs = []
+        for item in items or []:
+            text_key = str(item or '')
+            if '/' not in text_key:
                 continue
-            time.sleep(2)
-
-    def clear(self):
-        df = pd.read_csv('../rec_intention/kg_data/food.csv')
-        df['info'] = df['info'].apply(lambda x: '|'.join([i.split('/')[1] for i in sorted(eval(x))]))
-        df1 = df['info'].str.split('|', expand=True)
-        df.drop(['info'], inplace=True, axis=1)
-        df1.columns = ['func_type', 'rarity', 'getting1']
-        # print(df1)
-        df = df.join(df1)
-
-        def fill_food_name(name, cond):
-            name, cond = str(name), str(cond)
-            # print(cond)
-            if name != 'nan':
-                s = name
-            else:
-                if cond.startswith('完成烹饪'):
-                    s = '奇怪的' + cond[4:]
-                elif cond.startswith('成功烹饪'):
-                    s = cond[4:]
-                elif cond.startswith('完美烹饪'):
-                    s = '美味的' + cond[4:]
-                else:
-                    s = 'None'
-            return s
-
-        df['name'] = df.apply(lambda x: fill_food_name(x['name'], x['condition']), axis=1)
-        df['getting'] = df.apply(lambda x: '【' + str(x['getting1']) + '】' + str(x['getting']), axis=1)
-        df.drop(['getting1'], axis=1, inplace=True)
-        df.insert(0, 'id', [i for i in range(1, len(df) + 1)])
-        df.to_csv('../rec_intention/kg_data/done/label-food.csv', index=False, encoding='utf-8')
-        print(df)
+            key, value = text_key.split('/', 1)
+            key, value = key.strip(), value.strip()
+            if key and value:
+                pairs.append((key, value))
+        if pairs:
+            return pairs
+    return []
 
 
-class WeaponSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.weapon_id = list(pd.read_csv('../rec_intention/kg_data/mhy-id/weapon_id.csv')['mhy_id'])
-        self.path = '../rec_intention/kg_data/to_do/label-weapon.csv'
-
-    def parse(self):
-        for i in self.weapon_id:
-            url = self.url + str(i)
-            res = requests.get(url)
-            if res.status_code == 200:
-                # pprint.pprint(eval(res.text))
-                data = eval(res.text)['data']['content']
-                name = data['title']
-                id = data['id']
-                icon = data['icon']
-                ext = eval(eval(data['ext'])["c_5"]["filter"]["text"])
-                text = data['contents'][0]['text'].replace('\n', '')
-                desc = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('装备描述(.*?)冒险等阶限制', text)]
-                limit = re.findall('obc-tmpl__rich-text">冒险等阶限制：(.*?)</td></tr>', text)
-                # getting = [re.sub('<(.*?)>','',str(i)) for i in re.findall('obc-tmpl__rich-text">获取途径：(.*?)</p></td></tr>',text)]
-                story = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('相关故事(.*?)</p></div>', text)]
-                material = [re.sub('<(.*?)>', '', str(i)) for i in
-                            re.findall('<span class="obc-tmpl__icon-text">(.*?)</span>', text)]
-                material_num = [re.sub('<(.*?)>', '', str(i)) for i in
-                                re.findall('<span class="obc-tmpl__icon-num">(.*?)</span>', text)]
-                grade = [re.sub('<(.*?)>', '', str(i)) for i in
-                         re.findall('class="obc-tmpl__switch-btn">(.*?)</li>', text)]
-                effect = [re.sub('<(.*?)>', '', str(i)) for i in
-                          re.findall(r'<tbody><tr><td colspan="\d">(.*?)</li></ul></td></tr></tbody>', text)]
-                print(name)
-                data = [{'name': name, 'id': id, 'ext': ext, 'desc': desc, 'limit': limit, 'story': story,
-                         'material': material, "material_num": material_num, 'grade': grade, 'effect': effect,
-                         'icon': icon}]
-                df = pd.DataFrame(data=data)
-                if os.path.exists(self.path):
-                    df.to_csv(self.path, mode='a', index=False, header=False, encoding='utf-8')
-                else:
-                    df.to_csv(self.path, index=False, encoding='utf-8')
-                time.sleep(2)
-
-    def clear(self):
-        # name,id,ext,desc,limit,getting,story,material,"material_num",grade,effect
-        df = pd.read_csv(self.path)
-
-        def split_ext(x):
-            x = eval(x)
-            res = {'武器类型': 'None', '武器星级': 'None', '属性加成': 'None', '获取途径': 'None'}
-            for i in x:
-                s = i.split('/')
-                if res[s[0]] != 'None':
-                    res[s[0]] = res[s[0]] + f"、{s[1]}"
-                else:
-                    res[s[0]] = s[1]
-            res = [v for _, v in res.items()]
-            return '|'.join(res)
-
-        df['ext'] = df['ext'].apply(lambda x: split_ext(x))
-        df1 = df['ext'].str.split('|', expand=True)
-        df1.columns = ['weapon_type', 'rarity', 'attr_add', 'getting']
-        df = df.join(df1)
-
-        def skill(x, mode=0):
-            x = eval(x)
-            if not x:
-                return 'None'
-            else:
-                if mode == 0:
-                    s = ''.join(re.findall(r'\)(.*?)·', x[0]))
-                    return s if s else 'None'
-                else:
-                    sp = ''.join(re.findall(r'\)(.*?)·', x[0])) + '·'
-                    return x[0].replace(sp, '')
-
-        df['introd'] = df['desc'].apply(lambda x: skill(x, 0))
-        df['refine'] = df['desc'].apply(lambda x: skill(x, 1))
-
-        def add_material_num(name, num):
-            name, num = eval(name), eval(num)
-            index = name.index('摩拉')
-            res = []
-            for i in range(index):
-                res.append(name[i] + num[i])
-            return str(res)
-
-        df['material'] = df.apply(lambda x: add_material_num(x['material'], x['material_num']), axis=1)
-        df['grade'] = df['grade'].apply(lambda x: [i.replace(' ', '') for i in eval(x) if '角色' not in i])
-
-        def add_breaking(grade, effect):
-            grade, effect = grade, eval(effect)
-            res = {}
-            for i in range(len(grade)):
-                g = grade[i]
-                e = effect[i]
-                res[g] = e
-            return str(res)
-
-        df['breaking'] = df.apply(lambda x: add_breaking(x['grade'], x['effect']), axis=1)
-        df = df[['name', 'id', 'limit', 'story', 'material', 'icon', 'breaking', 'introd', 'refine', 'weapon_type',
-                 'rarity', 'attr_add', 'getting']]
-        df['limit'] = df['limit'].apply(lambda x: eval(x)[0] if eval(x) else '无')
-        df['story'] = df['story'].apply(lambda x: ''.join(eval(x)))
-        df['label'] = 'weapon'
-        print(df.head(10))
-        df.to_csv('../rec_intention/kg_data/done/label-weapon.csv', index=False, encoding='utf-8')
+def parse_detail_version(summary, title):
+    """从 summary/title 里抠出显式版本号（仅约 3% 条目有）。"""
+    blob = f'{summary or ""} {title or ""}'
+    m = re.search(r'(\d+\.\d+)\s*版本', blob)
+    return m.group(1) if m else ''
 
 
-class NPCSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.npc = list(pd.read_csv('../rec_intention/kg_data/mhy-id/npc_id.csv')['id'])
-        self.path = '../rec_intention/kg_data/to_do/label-npc.csv'
-
-    def parse(self):
-        for i in self.npc:
-            url = self.url + str(i)
-            res = requests.get(url)
-            if res.status_code == 200:
-                data = eval(res.text)['data']['content']
-                name = data['title']
-                id = data['id']
-                icon = data['icon']
-                text = data['contents'][0]['text'].replace('\n', '')
-                sex = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('<td class="h3">性别</td> <td>(.*?)</td>', text)]
-                sex = sex[0] if sex else ''
-                pos = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('<td class="h3">位置</td> <td>(.*?)</td>', text)]
-                pos = pos[0] if pos else ''
-                task = [re.sub('<(.*?)>', '', str(i)) for i in
-                        re.findall('<td class="h3">相关任务</td> <td>(.*?)</td>', text)]
-                task = task[0] if task else ''
-                profession = [re.sub('<(.*?)>', '', str(i)) for i in
-                              re.findall('class="obc-tmpl__rich-text"><p>(.*?)</p></td></tr>', text)]
-                profession = profession[0] if profession else ''
-                tips = [re.sub('<(.*?)>', '', str(i)) for i in
-                        re.findall('<p style="white-space: pre-wrap;">(.*?)</p></td></tr>', text)]
-                tips = list(set(tips))
-                print(id, name)
-                df = pd.DataFrame(data=[
-                    {'nhy_id': id, 'name': name, 'sex': sex, 'pos': pos, 'task': task, 'profession': profession,
-                     'tips': tips, 'icon': icon}])
-                # pprint.pprint(data)
-                if os.path.exists(self.path):
-                    df.to_csv(self.path, mode='a', index=False, header=False, encoding='utf-8')
-                else:
-                    df.to_csv(self.path, index=False, encoding='utf-8')
-                time.sleep(2)
-
-    def clear(self):
-        df = pd.read_csv(self.path)
-        df['task'] = df['task'].apply(lambda x: '暂无' if x in ['无', '暂无数据', '待录入'] else x)
-        df['profession'] = df['profession'].apply(lambda x: '暂无' if x in ['无', '暂无数据', '待录入'] else x)
-        df['tips'] = df['tips'].apply(
-            lambda x: str([i for i in eval(x) if not re.findall(r'\[每(.*?)日\]|食谱：|\[每周\]| \* |\d', i)]))
-        df['tips'] = df['tips'].apply(lambda x: ''.join(eval(x)))
-        df.fillna('暂无', inplace=True, axis=1)
-        df.to_csv('../rec_intention/kg_data/done/label-npc.csv', index=False, encoding='utf-8')
-        print(df['tips'])
+_TAG_RE = re.compile(r'<[^>]+>')
 
 
-class BreakMaterialSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-
-    def clear(self):
-        df = pd.read_csv('../rec_intention/kg_data/breaking_material.csv')
-        df = df[['material_id', 'name', 'info']]
-
-        def split_info(x, mode):
-            x = (eval(x))
-            x = [re.sub(r'[\d]+级\*(\d\d|\d)[；]*', '', i) for i in x]
-            getting_idx, desc_idx, using_idx = -1, -1, -1
-            for i in range(len(x)):
-                # if '获得方式：' in x[i]:
-                #     getting_idx = i
-                if x[i].startswith('描述：'):
-                    desc_idx = i
-                if x[i].startswith('用途：'):
-                    using_idx = i
-            if mode == 1:
-                return ''.join(x[:desc_idx])
-            if mode == 2:
-                return ''.join(x[desc_idx + 1:using_idx])
-            if mode == 3:
-                return ''.join(x[using_idx + 1:])
-
-        df['getting'] = df['info'].apply(lambda x: split_info(x, 1))
-        df['desc'] = df['info'].apply(lambda x: split_info(x, 2))
-        df['using'] = df['info'].apply(lambda x: split_info(x, 3))
-        df.drop(['info'], axis=1, inplace=True)
-        print(df.head(10))
-        df.to_csv('../rec_intention/kg_data/breaking_material1.csv', index=False, encoding='utf-8')
+def strip_html(text):
+    """HTML 片段 → 纯文本单行（用于详情页补充字段）。"""
+    return re.sub(r'\s+', ' ', _TAG_RE.sub(' ', str(text or ''))).strip()
 
 
-class AreaSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.area_id = list(set(list(pd.read_csv('../rec_intention/kg_data/mhy-id/area-id.csv')['mhy_id'])))
-        self.path = '../rec_intention/kg_data/to_do/label-area.csv'
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
 
-    def parse(self):
-        # print(self.area_id)
-        a = [1413, 115, 247, 120, 121]
-        for i in a:
-            url = self.url + str(i)
-            res = requests.get(url)
-            if res.status_code == 200:
-                try:
-                    data = eval(res.text)['data']['content']
-                    # pprint.pprint(data)
-                    id = data['id']
-                    icon = data['icon']
-                    name = data['title']
-                    print(id, name, 'get')
-                    try:
-                        text = data['contents'][0]['text']
-                    except:
-                        text = data['content']
+class MihoyoClient:
+    """带重试、限速与统计的 ``requests`` 薄封装。
 
-                    desc = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('简述</td> <td>(.*?)</td>', text)]
-                    decryption = [re.sub('<(.*?)>', '|', str(i)) for i in
-                                  re.findall('<h2>机关</h2> (.*?)</tbody></table>', text)]
-                    evil_task = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('魔神任务</td> <td>(.*?)</td>', text)]
-                    legend_task = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('传说任务</td> <td>(.*?)</td>', text)]
-                    delegate_task = [re.sub('<(.*?)>', '|', str(i)) for i in
-                                     re.findall('委托任务</td> <td>(.*?)</td>', text)]
-                    world_task = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('世界任务</td> <td>(.*?)</td>', text)]
-                    common_master = [re.sub('<(.*?)>', '|', str(i)) for i in
-                                     re.findall('普通怪物</td> <td>(.*?)</td>', text)]
-                    elite_master = [re.sub('<(.*?)>', '|', str(i)) for i in
-                                    re.findall('精英怪物</td> <td>(.*?)</td>', text)]
-                    boss_master = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('BOSS</td> <td>(.*?)</td>', text)]
-
-                    role_material = [re.sub('<(.*?)>', '|', str(i)) for i in
-                                     re.findall('角色养成素材</td> <td>(.*?)</td>', text)]
-                    ingredient = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('食材</td> <td>(.*?)</td>', text)]
-                    material = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('材料</td> <td>(.*?)</td>', text)]
-                    specialty = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('区域特产</td> <td>(.*?)</td>', text)]
-
-                    # pprint.pprint(data)
-                    df = pd.DataFrame(
-                        data=[{'mhy_id': id, 'name': name, 'desc': str(desc), 'decryption': str(decryption),
-                               'evil_task': str(evil_task),
-                               'legend_task': str(legend_task), 'delegate_task': str(delegate_task),
-                               'world_task': str(world_task),
-                               'common_master': str(common_master), 'elite_master': str(elite_master),
-                               'boss_master': str(boss_master),
-                               'role_material': str(role_material), 'ingredient': str(ingredient),
-                               'material': str(material), 'specialty': str(specialty),
-                               'icon': icon}])
-                    if os.path.exists(self.path):
-                        df.to_csv(self.path, mode='a', index=False, header=False, encoding='utf-8')
-                    else:
-                        df.to_csv(self.path, index=False, encoding='utf-8')
-                except:
-                    print(id, name, 'error')
-                    continue
-            time.sleep(2)
-            # break
-
-    def clear(self):
-        df = pd.read_csv(self.path)
-        # df['sec_area'] = df['desc'].apply(lambda x:)
-        for col in list(df.columns)[3:-1]:
-            df[col] = df[col].apply(lambda x: [i for i in eval(x)[0].split('|') if
-                                               i.replace(' ', '').replace('非战斗类', '').replace('战斗类', '')] if eval(
-                x) else '暂无')
-        # print(df['delegate_task'])
-        # df1 = pd.read_csv('../rec_intention/kg_data/mhy-id/area-id.csv')
-        # area_dic = {}
-        # for _,row in df1.iterrows():
-        #     area_dic[row['first_area']] = {'second_area':row['second_area'],'country':row['country']}
-        # df['sec_area'] = ''
-        # df['country'] = ''
-        # for idx,row in df.iterrows():
-        #     df.loc[idx,'sec_area'] = area_dic[row['name']]['second_area']
-        #     df.loc[idx,'country'] = area_dic[row['name']]['country']
-        df.to_csv('../rec_intention/kg_data/done/label-area.csv', index=False, encoding='utf-8')
-
-
-class MaterialSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.material_id = list(set(list(pd.read_csv('../rec_intention/kg_data/add_material.csv')['mhy_id'])))
-        self.path = '../rec_intention/kg_data/to_do/label-material2.csv'
-
-    def parse(self):
-        for i in self.material_id:
-            url = self.url + str(i)
-            res = requests.get(url)
-            if res.status_code == 200:
-                try:
-                    data = eval(res.text)['data']['content']
-                    # pprint.pprint(data)
-
-                    id = data['id']
-                    icon = data['icon']
-                    name = data['title']
-                    print(id, name, 'get')
-                    try:
-                        text = data['contents'][0]['text']
-                    except:
-                        text = data['content']
-
-                    getting = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('获得方式：</label>(.*?)</td>', text)]
-                    description = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('描述：(.*?)</p></td>', text)]
-                    using = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('用途：(.*?)</p></td>', text)]
-
-                    # pprint.pprint(data)
-                    # mhy_id,name,type,getting,description,using,label
-                    df = pd.DataFrame(
-                        data=[{'mhy_id': id, 'name': name, 'type': 'cooking', 'description': str(description),
-                               'getting': str(getting), 'using': str(using),
-                               'icon': icon, 'label': 'material'}])
-                    if os.path.exists(self.path):
-                        df.to_csv(self.path, mode='a', index=False, header=False, encoding='utf-8')
-                    else:
-                        df.to_csv(self.path, index=False, encoding='utf-8')
-                except:
-                    # print(id, name, 'error')
-                    continue
-            time.sleep(2)
-            # break
-
-
-class InstanceSpider(MiHoYoSpider):
-    def __init__(self):
-        super().__init__()
-        self.instance_id = list(set(list(pd.read_csv('../rec_intention/kg_data/instance.csv')['mhy_id'])))
-        self.path = '../rec_intention/kg_data/to_do/label-instance.csv'
-
-    def parse(self):
-
-        # for i in [292,324,4469,2291,299,2293,301,4470]:
-        # for i in [4484,4485,4488,4810,4818,4817,1781,1407,2366,2637,2866,4483,2330,670,2309,671,707]:
-        # for i in [373,374,1782,1813,376,377,375,2311,3163,3889,4468,1378]:
-        # for i in [381, 1239, 1814, 3580, 2665]:
-        for i in self.instance_id:
-            url = self.url + str(i)
-            res = requests.get(url=url)
-            if res.status_code == 200:
-                data = eval(res.text)['data']['content']
-                # pprint.pprint(data)
-                icon = data['icon']
-                id = data['id']
-                name = data['title']
-                summary = data['summary']
-                print(summary)
-                try:
-                    text = data['contents'][0]['text']
-                except:
-                    text = data['content']
-                description = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('秘境简述</td> <td>(.*?)</td>', text)]
-                entrance_description = [re.sub('<(.*?)>', '', str(i)) for i in
-                                        re.findall('秘境入口简述</td> <td>(.*?)</td>', text)]
-                consumption = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('秘境消耗</td> <td>(.*?)</td>', text)]
-                online = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('联机</td> <td>(.*?)</td>', text)]
-                task = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('任务本</td> <td>(.*?)</td>', text)]
-                abnormal_situation = [re.sub('<(.*?)>', '|', str(i)) for i in
-                                      re.findall('                (.*?)</p></td></tr>', text)]
-                master = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('<br><span>(.*?)</span></a></td>', text)]
-                master = list(set(master))
-                fix_product = ['摩拉', '冒险阅历']
-                if '角色天赋培养素材' in summary:
-                    abnormal_situation = [i for i in abnormal_situation[0].split('|') if
-                                          re.findall('[\u4e00-\u9fa5]+', i)]
-                    date = [re.sub('<(.*?)>', '|', str(i)) for i in
-                            re.findall('奖励类型</p></td>(.*?)</p></td></tr>', text)]
-                    date = [j for j in date[0].split('|') if j]
-                    prob_product = [re.sub('<(.*?)>', '|', str(i)) for i in
-                                    re.findall('data-type="obc-content" target="_blank">(.*?)</a></p></td><td', text)]
-                    prob_product_cp = []
-                    [prob_product_cp.extend([i for i in j.split("|") if re.findall('教导|指引|哲学', i)]) for j in
-                     prob_product]
-                    prob_product = [set(), set(), set()]
-                    [prob_product[i % 3].add(prob_product_cp[i]) for i in range(len(prob_product_cp))]
-                    prob_product = [list(i) for i in prob_product]
-                    for i in range(0, 6, 2):
-                        data.append({'nhy_id': id, 'name': name, 'sec_instance': date[i],
-                                     'description': description[0].replace(',', '，'),
-                                     'entrance_description': entrance_description[0].replace(',', '，'),
-                                     'consumption': consumption[0].replace(',', '，'),
-                                     'online': online[0].replace(',', '，'), 'task': task[0].replace(',', '，'),
-                                     'date': date[i + 1],
-                                     'prob_product': prob_product[i // 2], 'fix_product': fix_product,
-                                     'master': master, 'icon': icon,
-                                     'abnormal_situation': ''.join(abnormal_situation[:-1]).replace(',', '，'),
-                                     'recommended_element': abnormal_situation[-1]})
-                elif '武器突破素材' in summary:
-                    abnormal_situation = [i for i in abnormal_situation[0].split('|') if
-                                          re.findall('[\u4e00-\u9fa5]+', i)]
-                    date = [re.sub('<(.*?)>', '|', str(i)) for i in re.findall('）</span></p></td>(.*?)掉落数', text)]
-                    date = [j for j in date[0].split('|') if j]
-                    prob_product = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('data-type="obc-content" target="_blank">(.*?)</a></p></td><td', text)]
-                    prob_product_cp = [set(), set(), set()]
-                    [prob_product_cp[i % 3].add(prob_product[i]) for i in range(len(prob_product))]
-                    prob_product = [list(i) for i in prob_product_cp]
-                    data = []
-                    for i in range(0, 6, 2):
-                        data.append({'nhy_id': id, 'name': name, 'sec_instance': date[i],
-                                     'description': description[0].replace(',', '，'),
-                                     'entrance_description': entrance_description[0].replace(',', '，'),
-                                     'consumption': consumption[0].replace(',', '，'),
-                                     'online': online[0].replace(',', '，'), 'task': task[0].replace(',', '，'),
-                                     'date': date[i + 1],
-                                     'prob_product': prob_product[i // 2], 'fix_product': fix_product,
-                                     'master': master, 'icon': icon,
-                                     'abnormal_situation': ''.join(abnormal_situation[:-1]).replace(',', '，'),
-                                     'recommended_element': abnormal_situation[-1]})
-                elif '试炼秘境' in summary:
-                    ext = eval(data['ext'])['c_54']['filter']['text']
-                    recommended_element = eval(ext)[-1].replace('推荐元素/', '').replace('元素', '')
-                    entrance_description = [re.sub('<(.*?)>', '', str(i)) for i in
-                                            re.findall('pre-wrap;">(.*?)</p></td>', text)]
-                    data = [{'nhy_id': id, 'name': name, 'sec_instance': '',
-                             'description': description[0].replace(',', '，'),
-                             'entrance_description': entrance_description[0].replace(',', '，'),
-                             'consumption': '',
-                             'online': '否',
-                             'task': '否',
-                             'date': '',
-                             'prob_product': '', 'fix_product': fix_product,
-                             'master': master, 'icon': icon,
-                             'abnormal_situation': '',
-                             'recommended_element': recommended_element}]
-                elif '圣遗物' in summary:
-                    abnormal_situation = [i for i in abnormal_situation[0].split('|') if
-                                          re.findall('[\u4e00-\u9fa5]+', i)]
-
-                    prob_product = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('target="_blank">(.*?)</a>', text)]
-                    prob_product = list(set(prob_product))
-
-                    data = [{'nhy_id': id, 'name': name, 'sec_instance': '',
-                             'description': description[0].replace(',', '，'),
-                             'entrance_description': entrance_description[0].replace(',', '，'),
-                             'consumption': consumption[0].replace(',', '，'),
-                             'online': online[0].replace(',', '，'), 'task': task[0].replace(',', '，'),
-                             'date': '',
-                             'prob_product': prob_product, 'fix_product': fix_product,
-                             'master': master, 'icon': icon,
-                             'abnormal_situation': ''.join(abnormal_situation[:-1]).replace(',', '，'),
-                             'recommended_element': abnormal_situation[-1]}]
-
-                elif '角色培养素材' in summary:
-                    prob_product = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('target="_blank">(.*?)</a>', text)
-                                    if len(i) < 15]
-                    prob_product = list(set(prob_product))
-                    data = [{'nhy_id': id, 'name': name, 'sec_instance': '',
-                             'description': description[0].replace(',', '，'),
-                             'entrance_description': entrance_description[0].replace(',', '，'),
-                             'consumption': consumption[0].replace(',', '，'),
-                             'online': online[0].replace(',', '，'), 'task': task[0].replace(',', '，'),
-                             'date': '',
-                             'prob_product': prob_product, 'fix_product': fix_product,
-                             'master': master, 'icon': icon,
-                             'abnormal_situation': '',
-                             'recommended_element': ''}]
-                df = pd.DataFrame(data=data)
-                if os.path.exists(self.path):
-                    df.to_csv(self.path, mode='a', index=False, header=False, encoding='utf-8')
-                else:
-                    df.to_csv(self.path, index=False, encoding='utf-8')
-                time.sleep(2)
-
-
-class OfficialNoticeSpider():
-    """
-    爬取米有社西风快递员官方公告内容
+    老脚本对每个条目 ``time.sleep(2)`` 且完全裸奔（无超时、无重试、
+    无 UA），网络一抖就整轮报废。这里改成指数退避重试 + 可调间隔，
+    并且每次请求都记进 :attr:`stats`，失败 id 会汇总进 manifest。
     """
 
-    def __init__(self):
-        self.url = 'https://bbs-api.mihoyo.com/post/wapi/userPost?size=20&uid=75276539'
-        self.header = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36'}
+    #: 图鉴根频道。一次请求即可拿到全部 30 个子频道的条目列表
+    #: （实测 13789 条），比逐频道请求省 29 次往返。
+    ROOT_CHANNEL_ID = 189
 
-    def parse(self):
-        next_offset = '7605649'
-        for i in range(100):
-            if next_offset:
-                url = self.url + '&offset=' + next_offset
-            else:
-                url = self.url
-            print(url)
-            res = requests.get(url, headers=self.header)
-            if res.status_code == 200:
-                text = json.loads(res.text)
-                # pprint.pprint(text)
-                my_offset = next_offset
-                next_offset = text['data']['next_offset']
-                info_list = text['data']['list']
-                data = []
-                for info in info_list:
-                    uid = info['post']['uid']
-                    post_id = info['post']['post_id']
-                    content = info['post']['content']
-                    # print(content)
-                    subject = info['post']['subject']
-                    structured_content = eval(info['post']['structured_content'])
-                    s_content = []
-                    for s in structured_content:
-                        if "insert" in s:
-                            if isinstance(s["insert"], str):
-                                s_content.append(s["insert"])
-                    data.append({'subject': subject, 'content': content, 'post_id': post_id,
-                                 'uid': uid, 's_content': s_content,
-                                 'my_offset': my_offset, 'next_offset': next_offset})
-                df = pd.DataFrame(data=data)
-                if os.path.exists('../rec_intention/notice.csv'):
-                    df.to_csv('../rec_intention/notice.csv', mode='a', header=False, index=False, encoding='utf-8')
-                else:
-                    df.to_csv('../rec_intention/notice.csv', index=False, encoding='utf-8')
-            time.sleep(3)
+    def __init__(self, interval=0.25, retries=3, timeout=40, verbose=True):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': USER_AGENT,
+            'Referer': 'https://ys.mihoyo.com/main/obc',
+            'Accept': 'application/json, text/plain, */*',
+        })
+        self.interval = max(0.0, interval)
+        self.retries = max(1, retries)
+        self.timeout = timeout
+        self.verbose = verbose
+        self._last_call = 0.0
+        self.stats = Counter()
+        self._tree = None
 
+    def _throttle(self):
+        """保证两次请求之间至少间隔 ``interval`` 秒。"""
+        gap = time.monotonic() - self._last_call
+        if gap < self.interval:
+            time.sleep(self.interval - gap)
+        self._last_call = time.monotonic()
 
-class Strategy():
-    """
-    攻略区爬虫
-    """
+    def log(self, message):
+        if self.verbose:
+            print(message, flush=True)
 
-    def __init__(self, ):
-        self.url = 'https://bbs-api.mihoyo.com/post/wapi/recommendWalkthrough?forum_id=43&gids=2&is_good=false&is_hot=true&size=20'
-        self.header = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36'}
+    def get_json(self, url, params=None, allow_null=False):
+        """GET 并返回 ``dict``；彻底失败返回 ``None``（不抛异常）。
 
-    def parse(self):
+        ``allow_null=True`` 时，HTTP 200 但 ``data`` 为空的响应**不算失败**
+        ——新版 wiki 条目走 ``content/info`` 正是这种「200 + 内容不存在」，
+        属于预期内，不该污染失败统计。
         """
-        hot
-        :return:
+        last_error = None
+        for attempt in range(1, self.retries + 1):
+            self._throttle()
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_error = exc
+                self.stats['network_error'] += 1
+            else:
+                self.stats['http_ok'] += 1
+                if resp.status_code == 200:
+                    try:
+                        payload = resp.json()
+                    except ValueError as exc:
+                        last_error = exc
+                    else:
+                        data = payload.get('data')
+                        if data or allow_null:
+                            return payload
+                        self.stats['empty_data'] += 1
+                        return None
+                elif resp.status_code == 404:
+                    self.stats['not_found'] += 1
+                    return None
+                else:
+                    last_error = RuntimeError(f'HTTP {resp.status_code}')
+                    self.stats['http_error'] += 1
+            if attempt < self.retries:
+                time.sleep(min(8.0, 1.5 * (2 ** (attempt - 1))))
+        self.stats['failed'] += 1
+        self.log(f'    ! 请求失败（{last_error}）: {url}')
+        return None
+
+    def catalog(self):
+        """取整棵频道树（``{频道id: [条目, ...]}``），**只请求一次并缓存**。
+
+        根频道（189「图鉴」）的响应里就带上了全部 30 个子频道的完整
+        ``list``，所以没必要一个频道一次请求。
         """
-        for i in range(9, 10):
-            try:
-                res = requests.get(url=self.url + '&offset=' + str(i), headers=self.header)
-                if res.status_code == 200:
-                    text = json.loads(res.text)
-                    # pprint.pprint(text)
-                    post = text['data']['posts']
-                    data = []
-                    for info in post:
-                        content = info['post']['content']
-                        subject = info['post']['subject']
-                        post_id = info['post']['post_id']
-                        uid = info['post']['uid']
-                        auther = info['user']['nickname']
-                        topics = info['topics']
-                        topic1, topic2, topic3 = [], [], []
-                        for t in topics:
-                            if 'content_type' in t and 'name' in t:
-                                if t['content_type'] == 1:
-                                    topic1.append(t['name'])
-                                elif t['content_type'] == 2:
-                                    topic2.append(t['name'])
-                                elif t['content_type'] == 3:
-                                    topic3.append(t['name'])
-                        structured_content = eval(info['post']['structured_content'])
-                        s_content = []
-                        for s in structured_content:
-                            if "insert" in s:
-                                if isinstance(s["insert"], str):
-                                    s_content.append(s["insert"])
-                        data.append({'subject': subject, 'content': content, 'post_id': post_id,
-                                     'uid': uid, 's_content': s_content, 'auther': auther,
-                                     'topic1': topic1, 'topic2': topic2, 'topic3': topic3})
-                    print(f"page:{i} got it...")
-                    df = pd.DataFrame(data=data)
-                    if os.path.exists('../rec_intention/hot_strategy.csv'):
-                        df.to_csv('../rec_intention/hot_strategy.csv', mode='a', header=False, index=False,
-                                  encoding='utf-8')
-                    else:
-                        df.to_csv('../rec_intention/hot_strategy.csv', index=False, encoding='utf-8')
-                    time.sleep(2)
-            except:
-                print(f'page {i} is errorrrrrrrrrrrrrr.........')
+        if self._tree is not None:
+            return self._tree
+        payload = self.get_json(
+            LIST_URL,
+            params={'app_sn': 'ys_obc', 'channel_id': self.ROOT_CHANNEL_ID})
+        tree = {}
+        if payload:
+            for block in payload.get('data', {}).get('list') or []:
+                self._index_channels(block, tree)
+        self._tree = tree
+        return tree
+
+    def _index_channels(self, node, tree):
+        """递归把频道树摊平成 ``{频道id: 条目列表}``。
+
+        ⚠️ 节点的 ``id`` 既可能是叶子频道（自带 ``list``），也可能是
+        中间分组（只有 ``children``）。两种都要收，且**同一个 id 可能在
+        树里出现多次**（分组节点与叶子同名），故用 ``setdefault`` 保留
+        先到的非空列表，别让后一个空壳把已有数据盖掉。
+        """
+        cid = node.get('id')
+        entries = node.get('list') or []
+        if cid is not None and entries:
+            tree.setdefault(cid, []).extend(entries)
+        for child in node.get('children') or []:
+            self._index_channels(child, tree)
+
+    def fetch_channel(self, channel_id):
+        """取指定频道的全部条目（走缓存的整棵树）。"""
+        return self.catalog().get(channel_id, [])
+
+    def fetch_detail(self, content_id):
+        """抓详情页 payload（``None`` 表示抓不到，新版条目属正常）。"""
+        payload = self.get_json(
+            INFO_URL,
+            params={'app_sn': 'ys_obc', 'content_id': content_id},
+            allow_null=True)
+        if not payload:
+            return None
+        return (payload.get('data') or {}).get('content')
+
+    def download(self, url, dest):
+        """下载图片到 ``dest``；已存在则跳过。返回是否成功。"""
+        if not url or os.path.exists(dest):
+            return bool(url)
+        self._throttle()
+        try:
+            resp = self.session.get(url, timeout=self.timeout)
+            if resp.status_code != 200 or not resp.content:
+                self.stats['image_error'] += 1
+                return False
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, 'wb') as fh:
+                fh.write(resp.content)
+        except (requests.RequestException, OSError):
+            self.stats['image_error'] += 1
+            return False
+        self.stats['image_ok'] += 1
+        return True
 
 
-class Newwest():
+# --------------------------------------------------------------------------
+# 数据模型
+# --------------------------------------------------------------------------
+
+class Node:
+    """一个待写出的实体。"""
+
+    __slots__ = ('type', 'type_cn', 'name', 'attrs', 'version', 'ctime', 'icon')
+
+    def __init__(self, type_key, type_cn, name):
+        self.type = type_key
+        self.type_cn = type_cn
+        self.name = name
+        self.attrs = {}
+        self.version = ''
+        self.ctime = ''
+        self.icon = ''
+
+
+class Relation:
+    """一条 ``src -[rel]-> dst`` 关系。
+
+    ⚠️ 端点存的是 **(类型, 名字)** 二元组而不是光名字：值型节点里
+    「至冬」既是 country 又是 area（角色频道的城市级「地区」），
+    只按名字反查类型会命中先注册的那个，导致关系被写进
+    ``rel-organization-area.csv``——文件名的方向就错了。
     """
-    最新发帖
-    """
 
-    def __init__(self):
-        self.url = 'https://bbs-api.mihoyo.com/post/wapi/getForumPostList?forum_id=43&gids=2&is_good=false&is_hot=false&page_size=20&sort_type=2'
-        self.header = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36'}
+    __slots__ = ('src', 'rel', 'dst', 'rel_cn', 'weight')
 
-    def parse(self):
-        # &last_id=31978671
-        last_id = '27964388'
-        for i in range(1000):
-            try:
-                if last_id:
-                    url = self.url + "&last_id=" + str(last_id)
-                else:
-                    url = self.url
-                print(f'【page: {i} last_id: {last_id}】is over...')
-                res = requests.get(url, headers=self.header)
-                if res.status_code == 200:
-                    text = json.loads(res.text)
-                    # pprint.pprint(text)
-                    my_last_id = last_id
-                    last_id = text['data']['last_id']
-                    info_list = text['data']['list']
-                    data = []
-                    for info in info_list:
-                        uid = info['post']['uid']
-                        post_id = info['post']['post_id']
-                        content = info['post']['content']
-                        # print(content)
-                        auther = info['user']['nickname']
-                        subject = info['post']['subject']
-                        structured_content = eval(info['post']['structured_content'])
-                        s_content = []
-                        for s in structured_content:
-                            if "insert" in s:
-                                if isinstance(s["insert"], str):
-                                    s_content.append(s["insert"])
-                        topics = info['topics']
-                        topic1, topic2, topic3 = [], [], []
-                        for t in topics:
-                            if 'content_type' in t and 'name' in t:
-                                if t['content_type'] == 1:
-                                    topic1.append(t['name'])
-                                elif t['content_type'] == 2:
-                                    topic2.append(t['name'])
-                                elif t['content_type'] == 3:
-                                    topic3.append(t['name'])
-                        data.append({'subject': subject, 'content': content, 'post_id': post_id,
-                                     'uid': uid, 's_content': s_content, 'auther': auther,
-                                     'my_last_id': my_last_id, 'last_id': last_id,
-                                     'topic1': topic1, 'topic2': topic2, 'topic3': topic3})
-                    df = pd.DataFrame(data=data)
-                    if os.path.exists('../rec_intention/最新发帖2.csv'):
-                        df.to_csv('../rec_intention/最新发帖2.csv', mode='a', header=False, index=False, encoding='utf-8')
-                    else:
-                        df.to_csv('../rec_intention/最新发帖2.csv', index=False, encoding='utf-8')
-                time.sleep(3)
-            except:
-                print(f'【page: {i} last_id: {last_id}】 is error...')
+    def __init__(self, src, rel, dst, rel_cn='', weight=''):
+        self.src = src
+        self.rel = rel
+        self.dst = dst
+        self.rel_cn = rel_cn
+        self.weight = weight
+
+    @property
+    def src_name(self):
+        return self.src[1]
+
+    @property
+    def dst_name(self):
+        return self.dst[1]
 
 
-class ArtifactsSpider():
-    def __init__(self):
-        self.url = 'https://api-static.mihoyo.com/common/blackboard/ys_obc/v1/content/info?app_sn=ys_obc&content_id='
-        self.id = [1563, 1643, 1644, 1645, 1595, 1596, 1597, 1598, 1599, 1600, 1601, 1602, 1603, 1604, 1605, 1606, 1607, 1636, 1637, 1638, 1639, 1628, 1629, 1630, 1631, 1632, 1633, 2321, 2322, 1983, 1984, 4341, 4335, 3866, 3867, 3157, 3158]
+# --------------------------------------------------------------------------
+# 采集
+# --------------------------------------------------------------------------
 
-    def parse(self):
-        data = []
-        for idd in self.id:
-            print(idd)
-            url = self.url+str(idd)
-            # print(url)
-            res = requests.get(url)
-            if res.status_code == 200:
-                text = json.loads(res.text)
-                # pprint.pprint(text)
-                name = text['data']['content']['title']
-                id = text['data']['content']['id']
-                effect = eval(text['data']['content']['ext'])["c_218"]["table"]["list"]
-                e = {}
-                for i in effect:
-                    e[i['key']] = i['value']
-                text = text['data']['content']['contents'][0]['text']
-                rarity = ''.join([re.sub('<(.*?)>', '', str(i)) for i in
-                          re.findall('稀有度</span>(.*?)</p>', text)])
-                rarity = rarity.replace(' ','')
-                getting = ''.join([re.sub('<(.*?)>', '', str(i)) for i in
-                          re.findall('获取途径</span>(.*?)</span>', text)])
-                getting = getting.replace(' ','')
-                flower = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('<td><label>生之花：</label>(.*?)</td>', text)]
-                feather = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('<td><label>死之羽：</label>(.*?)</td>', text)]
-                clock = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('<td><label>时之沙：</label>(.*?)</td>', text)]
-                cup = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('<td><label>空之杯：</label>(.*?)</td>', text)]
-                pileum = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('<td><label>理之冠：</label>(.*?)</td>', text)]
-                desc = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('<label>描述：</label>(.*?)</p>', text)]
-                img = [re.sub('<(.*?)>', '', str(i)) for i in
-                                    re.findall('src="(.*?)"></td>', text)]
-                equipment = flower+feather+clock+cup+pileum
-                for i in range(5):
-                    data.append({'mhy_id':id,'name':equipment[i],'introduction':desc[i],'rarity':rarity,'getting':getting,'icon':img[i],'type':name,'effect':e,'label':'artifacts'})
-                # print(data)
-                time.sleep(2)
-        df= pd.DataFrame(data=data)
-        df.to_csv('./aaa.csv',index=False,encoding='utf-8')
+class Spider:
+    """按频道采集，产出 :class:`Node` / :class:`Relation`。"""
+
+    def __init__(self, client, from_version='1.1', to_version='7.1',
+                 channels=None, limit=0, with_images=True, detail=False):
+        self.client = client
+        self.lo = version_tuple(from_version)
+        self.hi = version_tuple(to_version)
+        self.channels = list(channels or CHANNELS)
+        self.limit = limit
+        self.with_images = with_images
+        self.detail = detail
+        self.nodes = {}
+        self.relations = []
+        self.version_hist = Counter()
+        self.skipped_version = 0
+        self.failed_ids = []
+        #: 值型节点（元素/国家/武器类型…）的中文名 → 类型，用于跨频道复用，
+        #: 避免「风元素」和「风」裂成两个实体。
+        self._value_nodes = {}
+
+    # ---------- 版本窗 ----------
+
+    def _in_window(self, version):
+        """版本是否落在 ``[from, to]`` 窗内。
+
+        空版本（拿不到任何时间线索）**一律保留**——猜错版本就把实体丢掉
+        代价太大，宁可多留一条并让它带空 ``version``。
+        """
+        if not version:
+            return True
+        if version.endswith('-'):
+            return False
+        return self.lo <= version_tuple(version) <= self.hi
+
+    def _register_value_node(self, ntype, value, label_cn):
+        """登记（或复用）一个值型节点，返回节点名。
+
+        ⚠️ 缓存键必须是 ``(类型, 值)`` 而不是光值：同一个字符串在不同
+        类型下语义不同（「蒙德」既是国家也是地区名、「风」既是元素也是
+        秘境类型…）。只用值做键会让先注册的类型把后来的**吞掉**，
+        关系就会指到错误类型的节点上。
+        """
+        value = str(value).strip()
+        if not value or value in PLACEHOLDERS:
+            return ''
+        cache_key = (ntype, value)
+        if cache_key in self._value_nodes:
+            return value
+        node = Node(ntype, label_cn, value)
+        self.nodes[(ntype, value)] = node
+        self._value_nodes[cache_key] = value
+        return value
+
+    # ---------- 主流程 ----------
+
+    def run(self):
+        """采集所有选定频道。返回自身（便于链式调用）。"""
+        # 先把整棵频道树拉下来（一次请求），避免逐频道往返。
+        self.client.catalog()
+        for channel_id in self.channels:
+            spec = CHANNELS.get(channel_id)
+            if not spec:
+                self.client.log(f'  ? 跳过未知频道 {channel_id}')
+                continue
+            type_key, type_cn, wanted = spec
+            entries = self.client.fetch_channel(channel_id)
+            self.client.log(
+                f'  频道 {channel_id:>3} {type_cn}: 列表返回 {len(entries)} 条')
+            if self.limit:
+                entries = entries[:self.limit]
+            for entry in entries:
+                try:
+                    self._handle(entry, type_key, type_cn, wanted)
+                except Exception as exc:                  # noqa: BLE001
+                    # 单条失败不能拖垮整轮：记录 id 继续。
+                    self.failed_ids.append(
+                        (entry.get('content_id'), repr(exc)))
+        return self
+
+    def _handle(self, entry, type_key, type_cn, wanted):
+        """处理单条：建实体、抽关系、（可选）抓详情补字段。"""
+        title = (entry.get('title') or '').strip()
+        if not title:
+            return
+        content_id = entry.get('content_id')
+
+        ctime = ''
+        detail = None
+        if self.detail:
+            detail = self.client.fetch_detail(content_id)
+            ctime = extract_ctime(detail)
+            # 新版 wiki 条目（id ≥ 500000）拿不到详情，属预期内，不计失败。
+
+        version = parse_detail_version(entry.get('summary'), title)
+        if not version:
+            version = version_from_date(ctime)
+
+        if not self._in_window(version):
+            self.skipped_version += 1
+            return
+
+        node = Node(type_key, type_cn, title)
+        node.ctime = ctime
+        node.version = version
+        node.icon = entry.get('icon') or ''
+        if entry.get('summary'):
+            node.attrs['summary'] = str(entry['summary']).strip()
+
+        pairs = parse_filter(entry.get('ext'))
+        node.attrs['mhy_id'] = str(content_id or '')
+        #: 本频道里需要按国家口径处理的筛选键（如组织频道的「地区」）
+        country_key = COUNTRY_KEYS.get(type_key)
+        for key, value in pairs:
+            node.attrs[key] = value
+            if key == country_key:
+                # 组织频道的「地区」是国家口径，单独走 country 分支。
+                canon = COUNTRY_CANON.get(value, value)
+                country = self._register_value_node(
+                    'country', canon, self._cn_for('country'))
+                if country:
+                    self.relations.append(Relation(
+                        (type_key, title), 'part_of', ('country', country),
+                        REL_CN['part_of']))
+                continue
+            spec = VALUE_KEYS.get(key)
+            if not spec:
+                continue                       # 非节点型条件，只当属性
+            vntype, rel, rel_cn = spec
+            value_node = self._register_value_node(vntype, value, self._cn_for(vntype))
+            if value_node:
+                self.relations.append(Relation(
+                    (type_key, title), rel, (vntype, value_node), rel_cn))
+
+        self.nodes[(type_key, title)] = node
+        self.version_hist[version or '未知'] += 1
+
+        # 版本作为关系单独挂一条，便于图谱里按版本筛选实体。
+        if version:
+            ver_node = self._register_value_node('version', version, '版本')
+            if ver_node:
+                self.relations.append(Relation(
+                    (type_key, title), 'versioned_in', ('version', ver_node),
+                    REL_CN['versioned_in']))
+
+        if self.detail:
+            self._enrich_from_detail(node, detail)
+        if self.with_images and node.icon:
+            node.attrs['icon'] = node.icon
+
+    def _cn_for(self, ntype):
+        """值型节点的中文类型名。"""
+        return {'element': '元素', 'country': '国家', 'area': '地区',
+                'faction': '势力', 'weapon_type': '武器类型',
+                'instance_type': '秘境类型', 'enemy_type': '敌人类型',
+                'version': '版本'}.get(ntype, ntype)
+
+    def _enrich_from_detail(self, node, content):
+        """从已抓到的详情页补几个高价值字段（简介、正文摘要）。
+
+        只做「有就写、没有就跳过」的补充——详情页对新条目抓不到，
+        因此这条路径**不能**承担主链路。
+        """
+        if not content:
+            return
+        ctime = extract_ctime(content)
+        if ctime and not node.ctime:
+            node.ctime = ctime
+        summary = strip_html(content.get('summary'))
+        if summary and not node.attrs.get('summary'):
+            node.attrs['summary'] = summary[:200]
+        contents = content.get('contents') or []
+        if contents:
+            plain = strip_html(contents[0].get('text'))
+            if plain:
+                node.attrs['detail_text'] = plain[:600]
+
+    # ---------- 输出 ----------
+
+    def write(self, out_dir):
+        """把采集结果写到 ``out_dir``，返回 manifest 路径。"""
+        csv_dir = os.path.join(out_dir, 'csv')
+        os.makedirs(csv_dir, exist_ok=True)
+
+        by_type = defaultdict(list)
+        for node in self.nodes.values():
+            by_type[node.type].append(node)
+
+        files = []
+        for type_key, nodes in sorted(by_type.items()):
+            path = os.path.join(csv_dir, f'label-{type_key}.csv')
+            self._write_nodes(path, nodes)
+            files.append(os.path.basename(path))
+
+        rel_files = self._write_relations(csv_dir)
+        files.extend(rel_files)
+
+        manifest = {
+            'generated_by': 'tools/mihoyo_spider.py',
+            'version_window': [self._fmt_version(self.lo), self._fmt_version(self.hi)],
+            'version_estimation': (
+                'summary/title 中的「X.Y版本」字样优先；否则用详情页 ctime '
+                '映射到当时所处版本。两者都拿不到时 version 留空。'
+                '⚠️ wiki 条目 ctime 会因改版重建，版本为估计值，非权威上线版本。'),
+            'channels': list(self.channels),
+            'node_count': len(self.nodes),
+            'relation_count': len(self.relations),
+            'nodes_by_type': {t: len(v) for t, v in sorted(by_type.items())},
+            'version_histogram': dict(sorted(self.version_hist.items())),
+            'skipped_out_of_window': self.skipped_version,
+            'failed_entries': [{'content_id': cid, 'error': err}
+                               for cid, err in self.failed_ids[:50]],
+            'http_stats': dict(self.client.stats),
+            'csv_files': sorted(files),
+        }
+        manifest_path = os.path.join(out_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as fh:
+            json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        return manifest_path
+
+    @staticmethod
+    def _fmt_version(pair):
+        return f'{pair[0]}.{pair[1]}'
+
+    def _write_nodes(self, path, nodes):
+        """写实体表。表头固定为 kg_store 约定的四列 + 属性列。
+
+        ⚠️ 主键用 ``name``（英文名），空时回退 ``name_cn``——这是
+        ``kg_store._parse_node_file`` 的约定。原神实体暂无官方英文名，
+        故 ``name`` 留空、``name_cn`` 填中文名，导入时自动回退。
+        """
+        attr_keys = []
+        seen = set(('mhy_id', 'version', 'ctime'))   # 已是固定列，别再写一遍
+        for node in nodes:
+            for key in node.attrs:
+                if key not in seen:
+                    seen.add(key)
+                    attr_keys.append(key)
+        attr_keys.sort()
+        with open(path, 'w', encoding='utf-8-sig', newline='') as fh:
+            writer = csv.writer(fh)
+            writer.writerow(['name', 'name_cn', 'label', 'label_cn',
+                             'mhy_id', 'version', 'ctime'] + attr_keys)
+            for node in sorted(nodes, key=lambda n: n.name):
+                row = ['', node.name, node.type, node.type_cn,
+                       node.attrs.get('mhy_id', ''), node.version, node.ctime]
+                row += [str(node.attrs.get(key, '')).replace('\n', ' ')
+                        for key in attr_keys]
+                writer.writerow(row)
+
+    def _write_relations(self, csv_dir):
+        """写关系表，按「源类型-目标类型」分文件，文件名即方向。
+
+        分文件的约定对齐 ``data/csv/rel-<src>-<dst>.csv``；
+        ``kg_store`` 导入时把文件名里的段当**类型提示**，所以
+        ``rel-character-element.csv`` 的方向确实是 人物 → 元素。
+
+        ⚠️ 端点必须是**已登记的节点**：关系里出现但节点表里没有的名字
+        （例如占位值被过滤掉）会被丢弃，否则导入时会变成指向空端的桩关系。
+        """
+        buckets = defaultdict(list)
+        for rel in self.relations:
+            if rel.src not in self.nodes or rel.dst not in self.nodes:
+                continue
+            buckets[(rel.src[0], rel.dst[0])].append(rel)
+
+        written = []
+        for (src_type, dst_type), rows in sorted(buckets.items()):
+            path = os.path.join(csv_dir, f'rel-{src_type}-{dst_type}.csv')
+            with open(path, 'w', encoding='utf-8-sig', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(['node1', 'rel', 'node2', 'rel_cn', 'weight'])
+                seen = set()
+                for rel in sorted(rows, key=lambda r: (r.src[1], r.rel, r.dst[1])):
+                    dedup = (rel.src[1], rel.rel, rel.dst[1])
+                    if dedup in seen:
+                        continue
+                    seen.add(dedup)
+                    writer.writerow([rel.src[1], rel.rel, rel.dst[1],
+                                     rel.rel_cn or rel.rel, rel.weight])
+            written.append(os.path.basename(path))
+        return written
 
 
-    def clear(self):
-        df = pd.read_csv('../rec_intention/kg_data/to_do/label-sacred-relic.csv')
+# --------------------------------------------------------------------------
+# 图片
+# --------------------------------------------------------------------------
 
-        def split_desc(x):
-            x = eval(x)
-            rarity = x[0]
-            x = x[1:]
-            dropping, role,  = [], []
-            desc,effect = '',''
-            for i in x:
-                if re.findall('掉落|获取|奖励|概率掉落', str(i)):
-                    dropping.append(i.split('：')[0])
-                else:
-                    # print(len(x),i)
-                    idx = x.index(i)
-                    # print(idx)
-                    x = x[idx:]
-                    break
-
-            flag = False
-            for i in range(len(x)):
-                if '描述' in x[i] and not flag:
-                    effect = ''.join(x[:i])
-                    flag = True
-                elif '描述' in x[i] and flag:
-                    desc += x[i].replace('描述：','')
-                elif '描述' not in x[i] and flag:
-                    role.append(x[i])
-
-            return pd.Series([rarity, dropping, effect, desc, role])
-
-        df[['rarity', 'dropping', 'effect', 'description', 'applicable_roles']] = df['desc'].apply(
-            lambda x: split_desc(x))
-        df.drop(['desc'],axis=1,inplace=True)
-        df.to_csv('../rec_intention/kg_data/done/label-sacred-relic.csv',index=False,encoding='utf-8')
-        print(df['rarity'])
-        print(df['dropping'])
-        print(df['effect'])
-        print(df['description'])
-
-
-if __name__ == "__main__":
-    url = 'https://api-static.mihoyo.com/common/blackboard/ys_obc/v1/content/info?app_sn=ys_obc&content_id='
-    df = pd.read_csv('../rec_intention/kg_data/label-food.csv')
-    id = list(set(df['mhy_id'].tolist()))
+def download_images(spider, out_dir, client):
+    """按类型分目录下载图标，返回 ``{类型: 成功数}``。"""
+    if not spider.with_images:
+        return {}
     result = {}
-    for i in id:
-        res = requests.get(url+str(i))
-        # print(res)
-        if res.status_code ==200:
-            text = json.loads(res.text)['data']['content']['contents'][0]['text']
-            # pprint.pprint(text)
-            icon = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('src="(.*?)"></td>', text)]
-            name = [re.sub('<(.*?)>', '', str(i)) for i in re.findall('名称：(.*?)</td>', text)]
-            for i in range(len(name)):
-                n = re.sub('[^\u4e00-\u9fa5]+','',name[i])
-                result[n] = icon[i]
-    print(result)
+    by_type = defaultdict(list)
+    for node in spider.nodes.values():
+        if node.icon:
+            by_type[node.type].append(node)
+    for type_key, nodes in sorted(by_type.items()):
+        folder = os.path.join(out_dir, 'images', type_key)
+        os.makedirs(folder, exist_ok=True)
+        ok = 0
+        for index, node in enumerate(nodes, 1):
+            name = safe_filename(node.name, fallback=str(index))
+            dest = os.path.join(folder, f'{name}.png')
+            if client.download(node.icon, dest):
+                ok += 1
+            if index % 50 == 0:
+                client.log(f'      图片 {index}/{len(nodes)}')
+        result[type_key] = ok
+        client.log(f'    图片 {type_key}: {ok}/{len(nodes)}')
+    return result
 
-    df['icon'] = df['name'].apply(lambda x:result[re.sub('[^\u4e00-\u9fa5]+','',x)])
-    df.to_csv('../rec_intention/kg_data/done/label-food2.csv',index=False,encoding='utf-8')
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description='抓取原神图鉴素材与知识图谱数据',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split('用法')[-1] if __doc__ else None)
+    parser.add_argument('--out', default=DEFAULT_OUT_DIR,
+                        help=f'输出目录（默认 {DEFAULT_OUT_DIR}）')
+    parser.add_argument('--from-version', default='1.1', help='起始版本（默认 1.1）')
+    parser.add_argument('--to-version', default='7.1', help='结束版本（默认 7.1）')
+    parser.add_argument('--channels', nargs='*', type=int, default=None,
+                        metavar='ID',
+                        help='只抓这些频道（默认全部：' +
+                             ' '.join(str(c) for c in CHANNELS) + '）')
+    parser.add_argument('--limit', type=int, default=0,
+                        help='每频道最多取几条（0 = 不限，用于试跑）')
+    parser.add_argument('--interval', type=float, default=0.25,
+                        help='两次请求最小间隔秒数（默认 0.25）')
+    parser.add_argument('--no-images', action='store_true', help='不下载图片')
+    parser.add_argument('--detail', action='store_true',
+                        help='额外抓详情页补简介/正文（慢很多，新条目抓不到）')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='只统计不写盘')
+    parser.add_argument('--quiet', action='store_true', help='不打印进度')
+    return parser
 
 
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    client = MihoyoClient(interval=args.interval, verbose=not args.quiet)
+
+    client.log(f'频道: {args.channels or list(CHANNELS)}')
+    client.log(f'版本窗: {args.from_version} ~ {args.to_version}')
+
+    started = time.time()
+    spider = Spider(
+        client,
+        from_version=args.from_version,
+        to_version=args.to_version,
+        channels=args.channels,
+        limit=args.limit,
+        with_images=not args.no_images,
+        detail=args.detail,
+    ).run()
+
+    client.log('')
+    client.log(f'实体 {len(spider.nodes)} 个，关系 {len(spider.relations)} 条')
+    client.log('版本分布: ' + ', '.join(
+        f'{k}×{v}' for k, v in sorted(spider.version_hist.items())))
+    if spider.skipped_version:
+        client.log(f'版本窗外跳过: {spider.skipped_version} 条')
+    if spider.failed_ids:
+        client.log(f'失败条目: {len(spider.failed_ids)} 条（详见 manifest）')
+
+    if args.dry_run:
+        client.log('--dry-run：不写盘')
+        return 0
+
+    images = download_images(spider, args.out, client)
+    manifest_path = spider.write(args.out)
+    client.log('')
+    client.log(f'图片合计 {sum(images.values())} 张 -> {os.path.join(args.out, "images")}')
+    client.log(f'图谱 CSV -> {os.path.join(args.out, "csv")}')
+    client.log(f'清单 -> {manifest_path}')
+    client.log(f'耗时 {time.time() - started:.1f}s')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -1,5 +1,5 @@
 # 原神-桌面伙伴
-## 安装包和第知识图谱数据
+## 安装包和知识图谱数据
 通过网盘分享的文件：3.8.3
 链接: https://pan.baidu.com/s/1xeWh20HxcCA420cVye4A5g?pwd=5tuv 提取码: 5tuv
 
@@ -38,7 +38,7 @@ Pilot-KG-Genshin/
 ├── data/                    ⚠️ 仅构建输入：既不入 git、也不随安装包分发
 │   ├── config.json          出厂配置种子（构建 config.db 用，v3.8 起为 JSON）
 │   └── csv/                 知识图谱初始 CSV（27 个，构建 kg.db 用）
-|   └── png/、music/         原始素材目录（打包进 assets.db 后可不分发）
+|   └── png/、music/         原始素材目录（打包进 assets.db 后可不分发）
 ├── res/
 │   └── help.html          帮助文档（v3.8 外置，启动时动态读取）
 ├── ico/                     图标（icon256.ico / .bmp、app_icon.ico、logo.ico）
@@ -211,3 +211,14 @@ QT_QPA_PLATFORM=offscreen SDL_AUDIODRIVER=dummy uv run python pilot.py
 本项目源码以 **Apache License 2.0** 开源（详见 [LICENSE](LICENSE)）。
 游戏图像、语音等素材版权归上海米哈游网络科技股份有限公司所有，
 仅供学习交流，请勿用于商业用途。
+
+## 后续开发计划
+1. 支持个性化UI、支持QSS，实现炫酷的前端界面。
+2. 支持端侧Agent，调用Hermes API。
+3. 支持与智能助手/桌面伙伴的动作交换，一些类似于QQ宠物的小游戏。
+4. 支持apng格式的导入，提高加载素材的速度，减少零碎文件。
+5. 支持矢量化的角色导入，无损放大和缩小人物。（备注：有点难实现）
+6. 支持更多的图功能。
+7. 支持客户端的动态更新和资源动态下载，按需从服务器（CDN）下载自己感兴趣的素材。
+8. 支持P2P通讯，实现与其他客户端的匿名通讯。（备注：技术上可行，但通常有法律风险）
+9. 支持Beta和Stable分支的发布，构建良好的技术交流社区。（备注：需要比较高的社区热度）

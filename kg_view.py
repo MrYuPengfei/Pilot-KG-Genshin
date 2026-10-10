@@ -13,20 +13,38 @@
 **带权重的边**：关系表带 ``weight`` 列时（如 data/csv-edu 的 1~10 评分），
 边的粗细与颜色深浅随权重变化，边标签追加权重值。全默认权重的图谱
 （weight = 1.0）渲染结果与早期版本完全一致。
+
+**有向图**：边不再是无向直线，而是带箭头的有向边。
+:attr:`KGStore.neighbor_details_directed` 会告诉你每条关系是 ``out``
+（本节点 → 对端）还是 ``in``（对端 → 本节点）：
+
+- ``out``（出边）：实线 + 箭头落在**邻居**上；
+- ``in``（入边）：虚线 + 箭头落在**中心节点**上。
+
+⚠️ 早期版本用 ``QGraphicsLineItem`` 画直线，只有位置没有方向，
+「衍生自 foundation model」和「foundation model 衍生自」长得一模一样。
+方向在**数据层一直都有**（``kg_edges`` 存的就是有向三元组），只是画布没画出来。
 """
 
 import html
 import math
 
 from PySide6.QtCore import Qt, Signal, QPointF
-from PySide6.QtGui import QColor, QPen, QBrush, QFont, QFontMetricsF, QPainter
+from PySide6.QtGui import (QColor, QPen, QBrush, QFont, QFontMetricsF, QPainter,
+                           QPainterPath)
 from PySide6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsEllipseItem,
-                               QGraphicsTextItem, QGraphicsLineItem)
+                               QGraphicsTextItem, QGraphicsPathItem)
 
 from kg_store import NODE_TYPES, DEFAULT_WEIGHT
 
 CENTER_RADIUS = 26
 NODE_RADIUS = 15
+
+# 有向边的几何：线不要顶到圆心上，要从圆边出发；箭头占掉末端一段长度。
+# 留空隙（gap）避免粗线与节点描边叠在一起显得糊。
+ARROW_GAP = 3.0
+ARROW_LEN_MIN = 8.0
+ARROW_WID_RATIO = 0.55
 
 # 节点标签排版：英文名按词折行，最多 NODE_LABEL_MAX_LINES 行；
 # 中文名单行、超长省略。宽度用来估算节点间距（见 show_ego）。
@@ -42,6 +60,9 @@ LABEL_SUB = '#7f8c8d'
 # 边的关系标签：关系中文名深色、英文名浅灰，便于一眼分辨主次
 EDGE_LABEL_MAIN = '#34495e'
 EDGE_LABEL_SUB = '#95a5a6'
+# 有向边的文字方向标记（与 edge_label_html 的 direction 参数配套）
+EDGE_ARROW_OUT = '→'
+EDGE_ARROW_IN = '←'
 
 # 权重 → 视觉映射。csv-edu 用 1~10 整数评分，故上限取 10；
 # 超出范围（0~1 的相似度、0~100 的百分比）会被夹到端点，不会画成负宽度。
@@ -167,12 +188,23 @@ def node_label_html(name, cn_name, center=False):
     return ''.join(parts)
 
 
-def edge_label_html(rel_cn, rel_en, weight):
-    """边标签的 HTML：关系中文名 + 英文名（灰色）+ 权重。
+def edge_label_html(rel_cn, rel_en, weight, direction=None):
+    """边标签的 HTML：方向箭头 + 关系中文名 + 英文名（灰色）+ 权重。
 
     中英同名（如用户自建关系名恰好等于中文）时不重复显示。
+
+    ``direction`` 为 ``'out'``/``'in'`` 时在标签前加 ``→``/``←``，
+    这是有向图的**文字兜底**：箭头图形之外，标签本身也说明关系指向，
+    缩放得很小看不清箭头时仍能读懂。``None``（默认）表示不标方向，
+    供不需要方向的旧调用保持原样。
     """
-    parts = [f'<span style="color:{EDGE_LABEL_MAIN};">'
+    if direction == 'out':
+        arrow = f'<b>{EDGE_ARROW_OUT}</b> '
+    elif direction == 'in':
+        arrow = f'<b>{EDGE_ARROW_IN}</b> '
+    else:
+        arrow = ''
+    parts = [f'{arrow}<span style="color:{EDGE_LABEL_MAIN};">'
              f'{html.escape(rel_cn)}</span>']
     if rel_en and rel_en != rel_cn:
         parts.append(f' <span style="color:{EDGE_LABEL_SUB}; '
@@ -261,6 +293,78 @@ class NodeItem(QGraphicsEllipseItem):
         event.accept()
 
 
+class ArrowEdgeItem(QGraphicsPathItem):
+    """有向边：从源点画一条线到目标点，并在**目标端**画箭头。
+
+    ⚠️ 早期版本用 ``QGraphicsLineItem(0, 0, x, y)`` 画边——那只是条直线，
+    从中心到邻居，看起来完全对称，方向信息全丢。这里改用
+    ``QGraphicsPathItem``：线段 + 目标端三角箭头合成一条路径，
+    用同一支笔刷既描边又填充（线段子路径面积为 0，填充无副作用）。
+
+    端点会**按节点半径内缩**：线从圆的边缘出发而不是圆心，
+    否则箭头会埋在圆形里、看着像没画箭头。
+    """
+
+    def __init__(self, src, dst, src_radius, dst_radius, weight,
+                 direction='out', pen=None):
+        super().__init__()
+        self.direction = direction
+        self.weight = weight
+        self.src = QPointF(*src)
+        self.dst = QPointF(*dst)
+        self.src_radius = src_radius
+        self.dst_radius = dst_radius
+        # 用调用方给的笔（通常按权重算好、入边再改虚线），没有则按权重现算一支。
+        self.setPen(pen if pen is not None else edge_pen(weight))
+        self.setBrush(QBrush(self.pen().color()))
+        self.setZValue(0)
+        # 箭头尖端留在属性里：QPainterPath 不暴露 subpaths()，外部（测试、
+        # 悬停命中）想确认「箭头指哪」时直接读这个点，不用去解析路径元素。
+        self.tip = None
+        self.tail = None
+        self._build()
+
+    def _build(self):
+        """按当前端点与两端半径重建路径（重算偏移后要再调一次）。"""
+        dx = self.dst.x() - self.src.x()
+        dy = self.dst.y() - self.src.y()
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            self.setPath(QPainterPath())
+            self.tip = None
+            self.tail = None
+            return
+        ux, uy = dx / length, dy / length
+        # 起点从源圆边缘往外推，终点停在目标圆边缘外
+        sx = self.src.x() + ux * (self.src_radius + ARROW_GAP)
+        sy = self.src.y() + uy * (self.src_radius + ARROW_GAP)
+        ex = self.dst.x() - ux * (self.dst_radius + ARROW_GAP)
+        ey = self.dst.y() - uy * (self.dst_radius + ARROW_GAP)
+
+        pen_w = self.pen().widthF() or 1.0
+        # 箭头随线宽变粗，但有下限——太细的边配太小的箭头会看不见。
+        # ⚠️ 同时要**相对线长封顶**：高权重边线宽可达 6px，箭头按比例会长到
+        # 18px，在密集图里会盖住邻居的标签；线本身很短时更会喧宾夺主。
+        usable = max(0.0, length - self.src_radius - self.dst_radius - 2 * ARROW_GAP)
+        arrow_len = max(ARROW_LEN_MIN, pen_w * 3.0)
+        arrow_len = min(arrow_len, usable * 0.4)
+        arrow_w = arrow_len * ARROW_WID_RATIO
+        bx = ex - ux * arrow_len
+        by = ey - uy * arrow_len
+        # 垂直于线方向的单位向量，用来张箭头两侧
+        px, py = -uy, ux
+
+        path = QPainterPath(QPointF(sx, sy))
+        path.lineTo(bx, by)
+        path.moveTo(ex, ey)
+        path.lineTo(bx + px * arrow_w / 2, by + py * arrow_w / 2)
+        path.lineTo(bx - px * arrow_w / 2, by - py * arrow_w / 2)
+        path.closeSubpath()
+        self.setPath(path)
+        self.tip = QPointF(ex, ey)
+        self.tail = QPointF(sx, sy)
+
+
 class KGCanvas(QGraphicsView):
     """自我中心网画布：中心节点 + 邻居放射布局。"""
 
@@ -303,11 +407,14 @@ class KGCanvas(QGraphicsView):
     def show_ego(self, key):
         """以key 为中心绘制一跳自我中心网。
 
-        邻居按权重从大到小排（:meth:`KGStore.neighbor_details`），强关系
+        邻居按权重从大到小排（:meth:`KGStore.neighbor_details_directed`），强关系
         排在前面、线也更粗，形成可读的强弱层次。
 
-        边标签给「关系中文名 + 英文名 + 权重」，节点标签给「英文名 + 中文名」，
+        边标签给「方向 + 关系中文名 + 英文名 + 权重」，节点标签给「英文名 + 中文名」，
         两者都用 HTML 富文本，深浅两色区分主次。
+
+        **有向显示**：``out``（本节点 → 对端）画实线、箭头落在对端；
+        ``in``（对端 → 本节点）画虚线、箭头落在中心。
         """
         if self.kg is None or key not in self.kg.nodes:
             return
@@ -315,14 +422,14 @@ class KGCanvas(QGraphicsView):
         self._retire_items()     # 必须在 clear 之前置标记
         self._scene.clear()
 
-        # (rel, rel_cn, 对端键, 权重, 对端中文名)
-        neighbors = self.kg.neighbor_details(key)
+        # (rel, rel_cn, 对端键, 权重, 对端中文名, 'out'|'in')
+        neighbors = self.kg.neighbor_details_directed(key)
         n = len(neighbors)
 
         # 半径要放得下标签：按最长标签宽度估算每个节点需要的弧长，
         # 否则标签宽而节点密的图（如「foundation model」）会互相压字。
         widest = 0.0
-        for _rel, _rel_cn, other, _weight, cn in neighbors:
+        for _rel, _rel_cn, other, _weight, cn, _dir in neighbors:
             w = measure_text(other[1], 9)
             if cn:
                 w = max(w, measure_text(shorten(cn, CN_LABEL_MAX_CHARS), 7.5))
@@ -336,15 +443,27 @@ class KGCanvas(QGraphicsView):
             return radius * math.cos(angle), radius * math.sin(angle)
 
         # 先画边（置于节点下层）
-        for i, (rel, rel_cn, other, weight, _cn) in enumerate(neighbors):
+        for i, (rel, rel_cn, other, weight, _cn, direction) in enumerate(neighbors):
             x, y = place(i)
-            line = QGraphicsLineItem(0, 0, x, y)
-            line.setPen(edge_pen(weight))
-            line.setZValue(0)
-            self._scene.addItem(line)
-            # 关系标签放在 55% 处：中英关系名 + 权重
+            # ⚠️ 同一对端出现多次时**不需要**额外偏移：放射布局按条目逐个
+            # 分配角度槽位，那几条边本来就指向不同位置、不会重叠。
+            # （曾在这里加过垂直微偏移，结果反而让边不再正对节点中心。）
+            if direction == 'out':
+                src, dst = (0.0, 0.0), (x, y)
+                src_r, dst_r = CENTER_RADIUS, NODE_RADIUS
+            else:
+                # 入边：源在对端、目标在中心，箭头指回中心节点
+                src, dst = (x, y), (0.0, 0.0)
+                src_r, dst_r = NODE_RADIUS, CENTER_RADIUS
+            pen = edge_pen(weight)
+            if direction == 'in':
+                pen.setStyle(Qt.DashLine)
+            edge = ArrowEdgeItem(src, dst, src_r, dst_r, weight,
+                                 direction=direction, pen=pen)
+            self._scene.addItem(edge)
+            # 关系标签放在 55% 处：方向 + 中英关系名 + 权重
             text = QGraphicsTextItem()
-            text.setHtml(edge_label_html(rel_cn, rel, weight))
+            text.setHtml(edge_label_html(rel_cn, rel, weight, direction))
             text.setTextWidth(-1)
             br = text.boundingRect()
             text.setPos(x * 0.55 - br.width() / 2, y * 0.55 - br.height() / 2)
@@ -360,7 +479,7 @@ class KGCanvas(QGraphicsView):
         self._scene.addItem(center)
 
         # 邻居节点
-        for i, (rel, rel_cn, other, weight, cn) in enumerate(neighbors):
+        for i, (rel, rel_cn, other, weight, cn, _dir) in enumerate(neighbors):
             x, y = place(i)
             item = NodeItem(other, NODE_RADIUS, self, cn)
             item.setPos(QPointF(x, y))

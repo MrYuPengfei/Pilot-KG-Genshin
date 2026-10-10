@@ -596,13 +596,29 @@ class KGStore:
 
         返回 [(rel, rel中文, 对端键, 权重, 对端中文名), ...]。
         权重按大到小排，让强关系在放射布局里排在前面、视觉上更靠上。
+
+        画布要区分入边/出边时改用 :meth:`neighbor_details_directed`（6 元组）。
+        """
+        return [t[:5] for t in self.neighbor_details_directed(key)]
+
+    def neighbor_details_directed(self, key):
+        """在 :meth:`neighbor_details` 的基础上多带一个**方向**，共 6 元组。
+
+        返回 [(rel, rel中文, 对端键, 权重, 对端中文名, 'out'|'in'), ...]，
+        排序与 ``neighbor_details`` 完全一致（权重降序）。
+
+        ⚠️ ``self.adj`` 是**双向**邻接表（入边出边都塞进去），所以单看它
+        分不出方向，必须回到 ``self._edges`` 里查这条关系的**实际存储方向**。
+        方向错了画面就反了：``out`` 是「本节点 → 对端」，箭头落在对端；
+        ``in`` 是「对端 → 本节点」，箭头落在中心节点上。
         """
         result = []
         for rel, other in self.adj.get(key, []):
             triple = self._directed(key, rel, other)
             weight = self._weights.get(triple, DEFAULT_WEIGHT) if triple else DEFAULT_WEIGHT
             cn = self.nodes.get(other, {}).get('attrs', {}).get(CN_NAME_KEY) or ''
-            result.append((rel, self.rel_cn_of(rel), other, weight, cn))
+            direction = 'out' if (triple and triple[0] == key) else 'in'
+            result.append((rel, self.rel_cn_of(rel), other, weight, cn, direction))
         result.sort(key=lambda x: (-x[3], x[0], x[2][0], x[2][1]))
         return result
 
